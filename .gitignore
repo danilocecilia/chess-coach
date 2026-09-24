@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Stockfish engine (download separately to avoid 100MB+ binary in git)
+engines/
+
+# Local game logs, reports, and screen captures
+logs/*
+captures/*
+reports/*
+!logs/.gitkeep
+!captures/.gitkeep
+!reports/.gitkeep
+
+# Local hardware / monitor configuration and state
+board.json
+panel.json
+.overlay-state.json
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Operating system & editor files
+.DS_Store
+Thumbs.db
+*.tmp
+.vscode/
+.idea/

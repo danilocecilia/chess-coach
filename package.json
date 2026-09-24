@@ -1,0 +1,17 @@
+{
+  "name": "chess-coach",
+  "version": "1.0.0",
+  "description": "Live move grading from screen capture: OpenCV-free, Smart App Control safe.",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "calibrate": "node src/calibrate.js",
+    "calibrate:auto": "node src/calibrate.js --auto",
+    "find-board": "node tools/find-board.mjs",
+    "test": "node --test \"tests/*.test.js\""
+  },
+  "dependencies": {
+    "chess.js": "^1.0.0"
+  }
+}

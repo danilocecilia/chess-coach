@@ -81,6 +81,42 @@ test('refuses a frame where the winner barely leads the runner-up', () => {
   assert.ok(w.feed(f, det('e4f6')), 'a clear winner is still accepted');
 });
 
+test('a stale floor cannot veto a move that leaves no square wrong', () => {
+  /*
+   * The failure this comes from, measured on a real session: board.json said
+   * the board cost 43.4 to read, the board on screen actually cost 189 with
+   * every square correct, and `fits` — a mean test — refused 100 of the 107
+   * settled frames whose winner explained all 64 squares. 93%. Every move had
+   * to come back through the two-ply ladder instead, and the game was lost.
+   *
+   * Where squares are counted, the count is the answer. A hypothesis that
+   * leaves nothing wrong has already proved what the mean was asked to prove.
+   */
+  const w = new MoveWatcher({ floor: FLOOR, allow: 0, slack: 2 });
+  const f = still(100);
+  // Well over floor*slack + allow, and yet not one square is wrong.
+  const clean = { ...det('e2e4', { score: FLOOR * 6, err: FLOOR * 9 }),
+                  occluded: 0, stillMisfits: 2, bestMisfits: 0 };
+
+  assert.equal(w.feed(f, clean), null, 'first frame has nothing to compare to');
+  const got = w.feed(f, clean);
+  assert.ok(got, 'a fully-explained board must be accepted however stale the floor');
+  assert.equal(got.uci, 'e2e4');
+  assert.ok(w.overFloor > 0, 'and it must be counted, so the staleness can be reported');
+});
+
+test('without a square count, the mean still guards acceptance', () => {
+  // tools/probe.mjs and a board.json predating misfit counts come through here,
+  // and for those the mean is the only test there is. Removing it for them
+  // would accept a piece caught in mid-slide.
+  const w = new MoveWatcher({ floor: FLOOR, allow: 0, slack: 2 });
+  const f = still(100);
+  const noCount = det('e2e4', { score: FLOOR * 6, err: FLOOR * 9 });
+
+  w.feed(f, noCount);
+  assert.equal(w.feed(f, noCount), null, 'nothing fits, and nothing counted the squares');
+});
+
 test('reports losing track when nothing on screen fits', () => {
   const w = new MoveWatcher({ floor: FLOOR });
   const f = still(100);
@@ -184,6 +220,82 @@ test('a rung runs once per episode, even when a slow one stalls the counter', ()
   assert.equal(ladder.due(56, 56), true);
   assert.equal(ladder.due(80, 80), true);
   assert.equal(ladder.due(80, 56), false);
+});
+
+test('turning the board round forgets the floor, and a clean frame supplies a new one', () => {
+  /*
+   * The other way the same number went wrong. `floor` is written once at
+   * calibration and describes the board it was measured on; a rotation keeps
+   * every template valid — square shade is (rank + file) parity, which a
+   * rotation preserves — while making this one number describe nothing. On a
+   * real session the new-game rung correctly turned the board at frame 2, after
+   * which a perfect reading of the opening position cost 188.6 against a
+   * recorded floor of 43.4, and the mean test had negative headroom from then
+   * on: 48 of 58 moves came back through the ladder and the game was lost.
+   */
+  const w = new MoveWatcher({ floor: FLOOR, allow: 0, slack: 2 });
+  assert.equal(w.fits(FLOOR * 6), false, 'the floor has an opinion to begin with');
+
+  w.relearnFloor();
+  assert.equal(w.floor, null);
+  assert.equal(w.fits(FLOOR * 6), true,
+    'with no floor the mean has no opinion, and the square count does the work');
+
+  // A frame where the tracked position leaves nothing wrong is exactly what
+  // calibration measured, on the board as it now is.
+  const f = still(100);
+  const clean = { ...det('e2e4', { score: 50, err: 175 }),
+                  occluded: 0, stillMisfits: 0, bestMisfits: 0 };
+  w.feed(f, clean);
+  w.feed(f, clean);
+  assert.equal(w.floor, 175, 'the new floor is what a correct reading of this board costs');
+  assert.equal(w.floorPending, false);
+  assert.equal(w.relearned, 175, 'and it is reported, so the session can say so once');
+
+  // A frame that does not read cleanly cannot supply one.
+  const w2 = new MoveWatcher({ floor: FLOOR, allow: 0, slack: 2 });
+  w2.relearnFloor();
+  const murky = { ...det('e2e4', { score: 50, err: 175 }),
+                  occluded: 0, stillMisfits: 3, bestMisfits: 0 };
+  w2.feed(f, murky);
+  w2.feed(f, murky);
+  assert.equal(w2.floor, null, 'a board three squares wrong is not a measurement of anything');
+});
+
+test('a rung re-arms when the board moves under it, but not otherwise', () => {
+  /*
+   * The other half of the failure above. Once per episode stopped the same
+   * search being asked thirteen times about one board; it also stopped it being
+   * asked once about a *different* board. On a real session the two-ply rung ran
+   * while the truth was one ply ahead, refused, and then the board ran on to
+   * exactly two plies ahead — inside that rung's reach — and it never ran again,
+   * because it had already been ticked off.
+   *
+   * So the question is whether the arrangement of wrong squares has changed, not
+   * whether the rung has run.
+   */
+  const ladder = new Ladder();
+  assert.equal(ladder.due(32, 32, 3), true, 'first look at a board three squares wrong');
+  assert.equal(ladder.due(32, 32, 3), false, 'the same board is the same question');
+
+  assert.equal(ladder.due(32, 32, 4), true, 'the board moved; worth asking again');
+  assert.equal(ladder.due(32, 32, 4), false);
+
+  // Capped, so a board that churns cannot make a slow rung monopolise the poll.
+  assert.equal(ladder.due(32, 32, 5), true);
+  for (const shape of [6, 7, 8]) {
+    assert.equal(ladder.due(32, 32, shape), false, 'three attempts is the limit');
+  }
+
+  // A rung that passes no shape keeps the strict once-only behaviour, which is
+  // what the cheap rungs want: asking them twice costs more than it can return.
+  const cheap = new Ladder();
+  assert.equal(cheap.due(8, 8), true);
+  assert.equal(cheap.due(8, 8), false);
+
+  // And an episode ending re-arms everything, shape or no shape.
+  ladder.reset();
+  assert.equal(ladder.due(32, 32, 9), true);
 });
 
 test('a rung is not skipped when the counter jumps past it', () => {

@@ -8,7 +8,28 @@ import { spawn } from 'node:child_process';
 import { writeFileSync, readFileSync, renameSync, rmSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { ROOT } from './config.js';
-import { formatScore } from './verdict.js';
+import { formatScore, LABELS } from './verdict.js';
+
+/**
+ * The overlay's own colours, which do not turn with the report's theme.
+ *
+ * This panel floats over the chess site, not over the report, so it is always
+ * dark whatever the page behind it is set to. They live here rather than in
+ * `overlay.ps1` because the script used to re-type the hint teal as
+ * `FromArgb(27, 172, 166)` — the Brilliant colour, in decimal, a third copy of
+ * a value `verdict.js` already owns. Now the script is told.
+ *
+ * `report.js` reads these for its token block so the design system's
+ * `--overlay-*` set and the real window cannot drift apart.
+ */
+export const OVERLAY_INK = {
+  bg: '#262421',
+  verdict: '#ffffff',
+  eval: '#a8a6a3',
+  why: '#c3c2c0',
+  hint: LABELS.BRILLIANT.color,
+  onGrade: '#1c1a18',
+};
 
 export class Overlay {
   constructor({ x = 40, y = 40 } = {}) {
@@ -36,7 +57,12 @@ export class Overlay {
   }
 
   start() {
-    this.#write({ label: 'Waiting for a move...', why: '', eval: '', hint: '' });
+    this.#write({
+      label: 'Waiting for a move...', why: '', eval: '', hint: '',
+      // Sent once, before the window exists, so the first paint is already in
+      // the right colours rather than flashing the script's defaults.
+      ink: OVERLAY_INK,
+    });
     try { rmSync(this.hintFile, { force: true }); } catch { /* nothing stale, fine */ }
     const script = path.join(ROOT, 'ps', 'overlay.ps1');
     this.proc = spawn('powershell', [
@@ -64,8 +90,12 @@ export class Overlay {
       label: grade.label.name,
       glyph: grade.label.glyph,
       color: grade.label.color,
-      eval: `${formatScore(grade.scoreBefore)} -> ${formatScore(grade.scoreAfter)}`
-          + `   (-${grade.drop.toFixed(1)}% win)`,
+      // Kept short on purpose: this line is right-aligned in a 160px column
+      // beside the grade name, and the older "(-21.3% win)" phrasing wrapped
+      // and clipped there. The percentage is a win-probability drop everywhere
+      // in this product, so the word was never carrying much.
+      eval: `${formatScore(grade.scoreBefore)} → ${formatScore(grade.scoreAfter)}`
+          + ` · -${grade.drop.toFixed(1)}%`,
       why,
       hint: '',                    // the hint belonged to the move just played
     });

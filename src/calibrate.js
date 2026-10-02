@@ -22,7 +22,7 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { Chess } from 'chess.js';
 import { Capture } from './capture.js';
-import { BoardModel, CODES, detectFlipped, fenToGrid, squareName } from './board.js';
+import { BoardModel, CODES, chooseOrientation, fenToGrid, squareName } from './board.js';
 import { measureGrid } from './grid.js';
 import { findBoards } from './find-board.js';
 import { ROOT, BOARD_CONFIG, TEMPLATE_DIR, CAPTURE_DIR } from './config.js';
@@ -30,6 +30,28 @@ import { ROOT, BOARD_CONFIG, TEMPLATE_DIR, CAPTURE_DIR } from './config.js';
 const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
 const AUTO = process.argv.includes('--auto');
+
+/**
+ * `--flipped true|false`, the escape hatch for a board whose orientation the
+ * evidence cannot settle. Absent means "work it out", which is the normal path.
+ *
+ * Read here rather than where it is used, next to `AUTO` and before anything
+ * has been started: a typo is worth refusing over — silently reading `--flipped
+ * ture` as `false` would bake the wrong side into the templates — and this is
+ * the last point where refusing costs nothing to clean up.
+ */
+const FORCED_FLIP = (() => {
+  const i = process.argv.indexOf('--flipped');
+  if (i < 0) return null;
+  const v = process.argv[i + 1];
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  console.error(`--flipped takes "true" or "false", not ${v === undefined ? 'nothing' : `"${v}"`}.`);
+  process.exit(1);
+})();
+
+const fmt = (n) => (n == null ? '?' : n.toFixed(1));
+const side = (f) => (f == null ? 'no opinion' : f ? 'black at bottom' : 'white at bottom');
 
 /** Must match main.js: calibration should hold the bar detection will hold. */
 const MOVE_THRESHOLD = Number(process.env.COACH_MOVE_THRESHOLD ?? 6);
@@ -143,11 +165,82 @@ async function main() {
     mkdirSync(CAPTURE_DIR, { recursive: true });
     const shot = await cap.snap(path.join(CAPTURE_DIR, 'calibration.png'));
 
-    const { flipped, top, bottom } = detectFlipped(frame);
-    console.log(`orientation: ${flipped ? 'black at bottom (flipped)' : 'white at bottom'}`);
-    console.log(`  far-rank brightness ${top.toFixed(1)} vs near-rank ${bottom.toFixed(1)}`);
+    /*
+     * Orientation is measured, not guessed at — but not by asking which way
+     * round fits better, which is the one question that cannot answer it.
+     *
+     * `learn` fits its templates to whatever pixels sit under the grid it is
+     * handed, so a model learned the wrong way round explains its own
+     * calibration frame exactly as well as the right one. Not approximately:
+     * measured on four real boards across two themes, `still` came out
+     * bit-identical both ways. A tie every time meant the sort decided it, the
+     * sort is stable, and `build(false)` was first — so this used to answer
+     * "white at bottom" unconditionally, whatever was on the screen, while
+     * printing a fit comparison that looked like evidence.
+     *
+     * The cost was a game graded for the wrong player, and it was invisible
+     * from inside: the colour names live in the templates, so every later check
+     * is made of the same mistake and agrees with it.
+     *
+     * `chooseOrientation` asks two questions that are not made of the
+     * templates' labelling — how the men are inked, and which end of the board
+     * is brighter — and declines to answer when they disagree. See src/board.js.
+     */
+    const trial = new BoardModel({ flipped: false }).learn(frame, START);
+    const choice = chooseOrientation(trial, frame);
+    const ink = choice.ink, lit = choice.brightness;
 
-    const model = new BoardModel({ flipped }).learn(frame, START);
+    console.log('orientation:');
+    console.log(`  ink       white ${fmt(ink.white)} vs black ${fmt(ink.black)}`
+      + `  (apart by ${fmt(ink.separation)}, needs ${fmt(choice.bar)})`
+      + `  -> ${side(choice.byInk)}`);
+    console.log(`  brightness far ${fmt(lit.top)} vs near ${fmt(lit.bottom)}`
+      + `  -> ${side(lit.flipped)}`);
+
+    const forced = FORCED_FLIP;
+    if (forced != null) {
+      console.log(`  overridden by --flipped ${forced}`);
+    } else if (choice.flipped == null) {
+      /*
+       * Refusing beats guessing. Getting this wrong does not degrade the
+       * grading, it inverts it — every move of the game is attributed to the
+       * wrong player — and unlike a bad region or a stale theme it produces no
+       * symptom the session can see. So the one case where the evidence is not
+       * clear is the one case a human has to settle.
+       */
+      console.error('\nCannot tell which way round this board is.');
+      if (!choice.decisive) {
+        console.error(`The two sides are drawn too similarly (${fmt(ink.separation)} apart,`
+          + ` needs ${fmt(choice.bar)}) to say which one is White.`);
+      } else {
+        console.error(`The men say ${side(choice.byInk)} and the brightness says`
+          + ` ${side(lit.flipped)}, and they cannot both be right.`);
+      }
+      console.error('\nCheck the board is in the opening position and the region is the 8x8');
+      console.error('grid alone, then calibrate again. If it is already both, say which it is:');
+      console.error('  npm run calibrate -- --flipped true     (you are Black, black at bottom)');
+      console.error('  npm run calibrate -- --flipped false    (you are White, white at bottom)');
+      // Not `process.exit`: the capture daemon is shut down in the `finally`
+      // below, and exiting here would step over it and leave it running.
+      process.exitCode = 1;
+      return;
+    }
+
+    const flipped = forced ?? choice.flipped;
+    console.log(`  ${flipped ? 'black at bottom (flipped) — you are Black'
+      : 'white at bottom — you are White'}`);
+
+    // Re-learned rather than mirrored: `bare` is indexed by image square and
+    // the shade of each is taken through `flipped`, so the chosen orientation
+    // has to be the one the templates were built under.
+    const model = flipped === trial.flipped
+      ? trial : new BoardModel({ flipped }).learn(frame, START);
+    model.orientation = {
+      decidedBy: forced != null ? 'override' : 'ink+brightness',
+      ink: { white: ink.white, black: ink.black, separation: ink.separation, bar: choice.bar },
+      brightness: { top: lit.top, bottom: lit.bottom, flipped: lit.flipped },
+      agree: choice.agree,
+    };
 
     /*
      * Sanity check.
@@ -262,7 +355,21 @@ async function main() {
      * glance at the capture. The cost of staying silent was measured at two
      * sessions and twenty-one minutes with nothing graded.
      */
-    const median = [...costs].sort((a, b) => a - b)[32];
+    /*
+     * The median of the *occupied* squares, not of all 64.
+     *
+     * `[...costs].sort()[32]` was the intent and not the effect: backgrounds are
+     * learned per square, so all 32 empty squares fit themselves at a cost of
+     * exactly 0, and the 32nd of 64 sorted costs is therefore 0.00 on every
+     * calibration ever written. That made `median * 8` zero, the whole
+     * comparison collapse to the contrast term, and the test fire on four of
+     * seven good calibrations while still naming nothing useful. The occupied
+     * median is the number the message claims to print — 9 to 10 on a clean
+     * board here, against a `worst` of 1508 on the one that was decorated.
+     */
+    const grid = fenToGrid(START, flipped);
+    const held = costs.filter((_, i) => grid[i] !== 0).sort((a, b) => a - b);
+    const median = held[held.length >> 1];
     const suspect = worst > Math.max(median * 8, (contrast * 0.12) ** 2)
       ? squareName(costs.indexOf(worst), flipped) : null;
     const odd = model.oddBackgrounds();
@@ -283,6 +390,36 @@ async function main() {
       console.warn('  board is clean, and calibrate again.');
       console.warn('  Calibrating on a tinted square is not cosmetic — the tint is learned as');
       console.warn('  the square, and once it clears no move can ever explain the board again.');
+    }
+
+    /*
+     * The last question, and the only one that is refused outright: can this
+     * calibration see a move at all? See {@link BoardModel#blindMoves}. Every
+     * warning above describes a board that is probably wrong; this one describes
+     * a board that provably cannot work, so nothing is written and the session
+     * cannot be started on it.
+     *
+     * Refused rather than repaired. Clamping `squareLimit` to a sane value
+     * recovers nineteen of the twenty moves on the board that found this and
+     * leaves the twentieth — the one whose destination square had the highlight
+     * on it — invisible at every limit. A repair would call that board fixed and
+     * still lose the game to 1.d4.
+     */
+    const blind = model.blindMoves(frame, START, squareLimit);
+    if (blind.length) {
+      console.error(`\nThis calibration cannot see ${blind.length} of the 20 opening moves.`);
+      console.error(`  ${blind.slice(0, 8).join(' ')}${blind.length > 8 ? ' …' : ''}`);
+      console.error('Each of those would leave no square wrong, so playing it would look');
+      console.error('exactly like standing still and would never be detected.');
+      if (suspect) {
+        console.error(`\nThe cause is above: ${suspect} costs ${worst.toFixed(0)} against a typical`
+          + ` ${median.toFixed(0)}, which set the wrong-square limit to ${squareLimit}.`);
+      }
+      console.error(`\nOpen ${shot}. A last-move highlight from the previous game is the usual`);
+      console.error('cause — start a fresh game so the board is clean, then calibrate again.');
+      console.error('Nothing was written; your previous calibration is untouched.');
+      process.exitCode = 1;
+      return;
     }
 
     writeFileSync(BOARD_CONFIG, JSON.stringify({

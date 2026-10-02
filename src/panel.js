@@ -59,9 +59,71 @@ export function ink(gray, w, h) {
  * dragged by an outlier, and a quarter of it sits clear of the edges.
  */
 export function inkFloor(map, frac = 0.25) {
-  const sorted = Uint8Array.from(map).sort();
-  const solid = sorted[Math.floor(sorted.length * 0.995)];
+  /*
+   * Read off a fixed *count* of the strongest pixels, not a percentile.
+   *
+   * A percentile silently assumes text covers a roughly constant share of the
+   * region, and the move list breaks that assumption every game: the container
+   * is a fixed size on screen and starts almost empty. Measured on a real
+   * panel, the 99.5th percentile gave 46 with the list full and 8 — the clamp,
+   * meaning it had landed in the background — with two rows on it. A floor
+   * that low calls antialiasing text, at exactly the moment the coach is
+   * trying to pick up the first move of a game.
+   *
+   * A count does not care what fraction of the panel is blank. Any text at all
+   * brings a few hundred solid pixels with it, so the 64th strongest is still
+   * a stroke and not an edge, whether the list holds two rows or forty — the
+   * same panel measured 47 at one, two, three and six rows, and 55 when full.
+   * The count is deliberately absolute rather than a share of the region: a
+   * share is just a percentile again, and would drift back with the size of
+   * the rectangle that was dragged.
+   *
+   * Counted through a histogram rather than a sort: the values are bytes, so
+   * this is one pass and 256 bins, which keeps it affordable per frame.
+   */
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < map.length; i++) hist[map[i]]++;
+  const want = 64;
+  let seen = 0, solid = 0;
+  for (let v = 255; v >= 0; v--) {
+    seen += hist[v];
+    if (seen >= want) { solid = v; break; }
+  }
+  // The clamp is what says "there is no text here" for a blank region, where
+  // the strongest pixels are noise a level or two off the background.
   return Math.max(8, Math.round(solid * frac));
+}
+
+/**
+ * Columns to ignore because they are a bar, not text.
+ *
+ * A move list grows a scrollbar the moment the game outgrows the panel, and a
+ * scrollbar is the one decoration that defeats every test above it: it has
+ * ink, it sits at a fixed x, and it appears on every row — which is precisely
+ * the signature of a text column, so the column check would confirm it as one.
+ * Some panels draw a vertical rule between the move columns and that behaves
+ * the same way.
+ *
+ * What separates them from text is not where they are but that they do not
+ * *stop*. Text lives inside a row and leaves the gap between rows empty; a bar
+ * runs straight through the gaps. So a column whose ink is continuous for
+ * longer than any glyph could be is masked out before the rows are found at
+ * all — otherwise it bridges every gap, and the whole panel bands as one row.
+ *
+ * A quarter of the panel is the bound, which no character approaches and no
+ * scrollbar worth the name falls under.
+ */
+export function barColumns(map, w, h, floor, frac = 0.25) {
+  const limit = Math.max(8, Math.floor(h * frac));
+  const bars = new Set();
+  for (let c = 0; c < w; c++) {
+    let run = 0;
+    for (let r = 0; r < h; r++) {
+      run = map[r * w + c] > floor ? run + 1 : 0;
+      if (run > limit) { bars.add(c); break; }
+    }
+  }
+  return bars;
 }
 
 /**
@@ -286,6 +348,35 @@ export function cluster(glyphs, limit = 400) {
 }
 
 /**
+ * Drop the rows the region cut in half.
+ *
+ * Once a game outgrows the panel the list scrolls, and a scrolled list almost
+ * never stops on a row boundary — the top and bottom of the region land in the
+ * middle of a row. Half a row still has ink, still bands, and still cuts into
+ * runs, so nothing downstream would notice; it would simply read a move from
+ * the half of the glyphs that survived.
+ *
+ * Which is worth being clear about, because scrolling costs less than it
+ * looks. It does not lose the game: every row carries its own move number, so
+ * a scrolled panel is a window that says where it is, and the rows that matter
+ * — the newest ones — are the rows a list scrolls *to*. The only real damage
+ * is at the two edges, and a clipped row gives itself away by being shorter
+ * than the rows it is stacked with.
+ *
+ * Only edge rows are eligible. A short band in the middle of the panel is
+ * something else — a result line, a header — and dropping it would be wrong.
+ */
+export function dropClipped(bands, h) {
+  if (bands.length < 3) return bands;
+  const heights = bands.map((b) => b.bottom - b.top + 1).sort((a, b) => a - b);
+  const typical = heights[heights.length >> 1];
+  const keep = (b, edge) =>
+    !(edge && (b.bottom - b.top + 1) < typical * 0.8);
+  return bands.filter((b, i) =>
+    keep(b, (i === 0 && b.top === 0) || (i === bands.length - 1 && b.bottom === h - 1)));
+}
+
+/**
  * The row step, as the median rather than the mean, with a count of how many
  * steps agree with it.
  *
@@ -336,14 +427,23 @@ export function columns(rows, tol = 4) {
 
 /**
  * Panel pixels -> rows of tokens. The whole segmentation, in one call.
+ *
+ * Order matters in one place: bars are masked before the rows are found, not
+ * after. A scrollbar runs through every gap between rows, so a pass that
+ * banded first would find a single band covering the whole panel and have
+ * nothing left to diagnose.
  */
 export function segment(gray, w, h, opts = {}) {
   const map = ink(gray, w, h);
   const floor = opts.floor ?? inkFloor(map);
-  const bands = rowBands(map, w, h, floor, opts);
+
+  const bars = opts.bars ?? barColumns(map, w, h, floor);
+  for (const c of bars) for (let r = 0; r < h; r++) map[r * w + c] = 0;
+
+  const bands = dropClipped(rowBands(map, w, h, floor, opts), h);
   const rows = bands.map((band) => ({ band, boxes: inkRuns(map, w, floor, band) }))
     .filter((r) => r.boxes.length > 0);
   const gap = opts.gap ?? gapThreshold(rows.map((r) => r.boxes));
   for (const r of rows) r.tokens = tokenize(r.boxes, gap);
-  return { map, floor, gap, rows };
+  return { map, floor, gap, rows, bars };
 }

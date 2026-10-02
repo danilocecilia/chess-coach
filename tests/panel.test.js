@@ -12,7 +12,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ink, inkFloor, rowBands, inkRuns, tokenize, gapThreshold, cut, cost, cluster, segment,
-  rowPitch, columns,
+  rowPitch, columns, barColumns, dropClipped,
 } from '../src/panel.js';
 
 const W = 40, H = 30;
@@ -188,6 +188,87 @@ test('a column is measured from its own edge, so graphics cannot chain into one'
   const solid = cols.filter((c) => c.n >= rows.length * 0.5);
   assert.deepEqual(solid.map((c) => c.x), [34, 182], 'only the two text columns are solid');
   assert.ok(cols.length >= 5, `the bars must stay scattered, got ${cols.length} columns total`);
+});
+
+test('the ink floor holds up on a panel that is nearly empty', () => {
+  /*
+   * Every game starts here. The move-list container is a fixed size on screen
+   * and begins with one row in it, so a threshold read as a percentile of the
+   * region lands in the background exactly when the first move needs reading —
+   * measured on a real panel, 46 with the list full and 8, the clamp, with two
+   * rows on it. A fixed count of the strongest pixels does not move.
+   */
+  // Each row carries ~100 solid pixels, as a row of real text does. A fixture
+  // thinner than the 64 the floor asks for would be measuring the shortfall
+  // rather than the property.
+  const rows = (n) => {
+    const img = striped([30, 30, 30]);
+    for (let i = 0; i < n; i++) box(img, 4, 2 + i * 10, 20, 5, 200);
+    return inkFloor(ink(img, W, H));
+  };
+
+  const full = rows(3), sparse = rows(1);
+  assert.ok(Math.abs(full - sparse) <= 4,
+    `floor moved from ${full} to ${sparse} as the panel emptied`);
+  assert.ok(sparse > 20, `floor ${sparse} is down in the background`);
+});
+
+test('a blank region finds no text rather than finding noise', () => {
+  const img = new Uint8Array(W * H);
+  for (let i = 0; i < img.length; i++) img[i] = 38 + (i * 7) % 3;   // background + noise
+  assert.equal(inkFloor(ink(img, W, H)), 8, 'the clamp is what says there is nothing here');
+  assert.deepEqual(segment(img, W, H).rows, []);
+});
+
+test('a scrollbar does not merge the whole panel into one row', () => {
+  /*
+   * The decoration that arrives exactly when the panel starts being useful: a
+   * game long enough to scroll grows a scrollbar, which has ink, sits at a
+   * fixed x, and appears on every row. Every structural test above reads that
+   * as a text column. What gives it away is that it runs through the gaps
+   * between rows, so unmasked it bridges them and the panel bands as one.
+   */
+  const img = striped([30, 30, 30]);
+  for (const y of [2, 12, 22]) box(img, 4, y, 3, 5, 200);
+  box(img, 38, 0, 2, H, 200);                  // the scrollbar, full height
+
+  const map = ink(img, W, H);
+  const floor = inkFloor(map);
+  const bars = barColumns(map, W, H, floor);
+  assert.deepEqual([...bars].sort((a, b) => a - b), [38, 39]);
+
+  const { rows } = segment(img, W, H, { minHeight: 3 });
+  assert.equal(rows.length, 3, 'the three text rows survive the bar');
+  for (const r of rows) {
+    assert.ok(r.boxes.every((b) => b.x1 < 38), 'no run may come from the bar');
+  }
+});
+
+test('rows the region cut in half are dropped, and only at the edges', () => {
+  /*
+   * A scrolled list does not stop on a row boundary, so the top and bottom of
+   * the region land mid-row. Half a row still has ink and still segments, so
+   * nothing downstream would notice it reading a move from half its glyphs.
+   * A short band in the *middle* is something else — a result line — and must
+   * survive.
+   */
+  const bands = [
+    { top: 0, bottom: 4 },        // clipped: at the edge and short
+    { top: 10, bottom: 23 },
+    { top: 30, bottom: 43 },
+    { top: 50, bottom: 55 },      // short, but not at an edge: a result line
+    { top: 60, bottom: 73 },
+    { top: 80, bottom: 84 },      // clipped: at the edge and short
+  ];
+  const kept = dropClipped(bands, 85);
+  assert.deepEqual(kept.map((b) => b.top), [10, 30, 50, 60]);
+});
+
+test('a full-height row at the edge is kept, since nothing was cut off it', () => {
+  const bands = [
+    { top: 0, bottom: 13 }, { top: 20, bottom: 33 }, { top: 40, bottom: 53 },
+  ];
+  assert.deepEqual(dropClipped(bands, 54).map((b) => b.top), [0, 20, 40]);
 });
 
 test('segment survives a panel with nothing in it', () => {

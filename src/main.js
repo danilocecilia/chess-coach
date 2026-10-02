@@ -13,15 +13,17 @@ import readline from 'node:readline';
 import path from 'node:path';
 import { Chess } from 'chess.js';
 import { Capture } from './capture.js';
-import { BoardModel, combine, decorated, gridOf, fenToGrid, indexOfSquare } from './board.js';
+import { BoardModel, combine, decorated, gridOf, fenToGrid, indexOfSquare,
+         orientationOf, ORIENTATION_MARGIN, inkTone, INK_MARGIN_RATIO } from './board.js';
 import { measureGrid } from './grid.js';
-import { MoveWatcher, Ladder, freshStart } from './watch.js';
+import { MoveWatcher, Ladder, freshStart, frameDiff, QUIET, OCCLUDE_MAX } from './watch.js';
 import { openLog, fileHash } from './log.js';
 import { Engine } from './engine.js';
 import { gradeMove } from './grade.js';
 import { explain, shouldExplain } from './coach.js';
 import { reviewGame, summarise } from './review.js';
 import { saveReview, rebuild, titleOf } from './report.js';
+import { Dashboard } from './dashboard.js';
 import { TOPICS, KEYS } from './hint.js';
 import { findThreat } from './threat.js';
 import { Overlay } from './overlay.js';
@@ -43,6 +45,12 @@ const POLL_MS = 150;
 const RESYNC_AFTER = 8;     // ~1.2s: you moved and we missed it
 const LOST_AFTER = 160;     // ~24s: every rung has failed; now it is worth saying
 const BLIND_AFTER = 40;     // ~6s of a covered board before mentioning it
+/**
+ * ~30s of it before treating the region rather than the board as the problem.
+ * Well past any modal, promotion picker or animation, and short of the 122
+ * seconds a real session spent watching a blank rectangle in silence.
+ */
+const BLIND_LOST = 200;
 
 /**
  * How often, in lost frames, to ask the log whether the screen is simply
@@ -57,6 +65,15 @@ const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 const START_MEN = START_FEN.split(' ')[0];
 /** A move must beat "nothing changed" by this much mean-squared-error to count. */
 const MOVE_THRESHOLD = Number(process.env.COACH_MOVE_THRESHOLD ?? 6);
+
+/**
+ * Accepted moves fitting worse than calibration promised before we say so.
+ *
+ * Enough that it is the calibration and not one decorated frame — a stale
+ * board.json misses by that much on every move, so a handful is already
+ * conclusive, and waiting longer only delays the one line that names the fix.
+ */
+const STALE_FLOOR_MOVES = 5;
 
 /**
  * How far above `squareLimit` a square's tint-fitted residual may go and still
@@ -111,16 +128,199 @@ async function main() {
   let playerColor = model.flipped ? 'b' : 'w';
   const chess = args.fen ? new Chess(args.fen) : new Chess();
 
+  // Written by calibration, which measures it off this board. The fallback is
+  // for a board.json from before that existed: the contrast term alone is a
+  // reasonable limit, just not one tuned to this theme.
+  const squareLimit = cfg.squareLimit ?? (model.contrast * 0.15) ** 2;
+  /** Derived, not calibrated: a multiple of the limit above. See {@link SOFT_SLACK}. */
+  const softLimit = squareLimit * SOFT_SLACK;
+
   // Opened before anything that can fail, and declared before `shutdown`, so a
   // Ctrl+C during startup closes it rather than landing on a dead zone.
   const log = openLog();
 
   const cap = await new Capture(cfg.region).start();
+
+  /** Which way round the board reads, from where the two colours are sitting. */
+  const facingOf = (det) => orientationOf(
+    Array.from({ length: 64 }, (_, i) => (det.mask[i] ? 0 : det.tint(i))),
+  );
+
+  /*
+   * Which colour you are, read off the board instead of taken on trust.
+   *
+   * Orientation used to be settled once, at calibration, and then treated as
+   * permanent. It is not: the templates belong to the board *skin*, which
+   * changes when you change theme, but which end you sit at changes every time
+   * you are handed the other colour — which is most games. Calibrating as White
+   * and then playing as Black left every move of that game attributed to the
+   * opponent, the coach advising the wrong side, and the one line that should
+   * have caught it ("you are White") stated as a fact with nothing behind it.
+   *
+   * `orientationOf` answers this from a reading rather than from a fit, so it
+   * works from any position and not only the opening. It is the same test
+   * `readBoard` already uses to refuse an upside-down reading; here it is
+   * allowed to *decide* rather than only to veto.
+   *
+   * What it cannot catch is templates whose colour labels were learned the
+   * wrong way round, because it reports where the men the templates call White
+   * are standing. That is calibration's problem and is settled there, by
+   * `chooseOrientation`, which measures the men themselves.
+   */
+  const settledFrame = async (tries = 8) => {
+    let prev = null;
+    for (let i = 0; i < tries; i++) {
+      const frame = await cap.grab();
+      if (prev && frameDiff(frame, prev) <= QUIET) return frame;
+      prev = frame;
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+    return null;
+  };
+
+  const frame0 = await settledFrame();
+  let facing0 = null, stale0 = null;
+  if (frame0) {
+    const det0 = model.detectMove(frame0, chess, { squareLimit, softLimit });
+    stale0 = model.themeDrift(frame0);
+    if (det0.occluded <= OCCLUDE_MAX) {
+      const f = facingOf(det0);
+      facing0 = { flipped: f.flipped, margin: f.margin, changed: false };
+      if (f.flipped != null && f.margin >= ORIENTATION_MARGIN && f.flipped !== model.flipped) {
+        model.flipped = f.flipped;
+        playerColor = model.flipped ? 'b' : 'w';
+        facing0.changed = true;
+      }
+    }
+  }
+
   const engine = await new Engine(STOCKFISH, { threads: 4 }).start();
   const overlay = new Overlay({ x: cfg.region.x, y: cfg.region.y + cfg.region.h + 12 }).start();
 
+  /*
+   * The dashboard, served for as long as the coach is running.
+   *
+   * On by default, because the point of it is not having to run anything: a
+   * review you have to go and ask for is one you ask for after you have stopped
+   * caring about the game. `COACH_DASHBOARD=0` turns it off, and a port already
+   * in use — the ordinary case of a second coach, or one left running — makes it
+   * quietly do nothing rather than failing to start a game.
+   *
+   * Served but not opened, which is the one thing this must not do. Everything
+   * here works by watching a region of the screen, so launching a browser window
+   * at startup lands it over the board, takes the focus off the site you were
+   * about to play on, and leaves the watch loop correctly reporting that it
+   * cannot see a board. The URL is printed below and the page is live from the
+   * first move; `COACH_OPEN=1` opts back in for a second monitor, and
+   * `npm run dashboard` still opens a tab because there is no board to cover.
+   */
+  const dash = new Dashboard({ open: process.env.COACH_OPEN === '1' });
+  if (process.env.COACH_DASHBOARD !== '0') await dash.start();
+
   console.log(`watching ${cfg.region.w}x${cfg.region.h} at (${cfg.region.x}, ${cfg.region.y})`);
   console.log(`you are ${playerColor === 'w' ? 'White' : 'Black'}; grading ${args.all ? 'both sides' : 'your moves'}`);
+  // Said out loud, because it contradicts what calibration recorded and a
+  // silent correction is indistinguishable from the bug it is correcting.
+  if (facing0?.changed) {
+    console.log(`        (read off the board — calibration had you as the other colour)`);
+  } else if (!facing0) {
+    console.log(`        (could not read the board to confirm this — from calibration)`);
+  }
+
+  /*
+   * A theme change is the one failure that looks exactly like a desync from the
+   * inside and is obvious from outside, so it is worth one frame at startup to
+   * say it plainly rather than 24 seconds of the ladder failing correctly.
+   */
+  /*
+   * Templates that name the wrong side White.
+   *
+   * This is the failure nothing downstream can see: the colour names live in
+   * the templates, so a model learned the wrong way round reads its board
+   * perfectly — zero squares wrong — and every check agrees with it, including
+   * the facing check above, which can only report where the men *it has been
+   * told* are White are standing. The only evidence is in the templates
+   * themselves, and it is one subtraction.
+   *
+   * Not corrected here, only refused. `flipped` rotates the board mapping; it
+   * does not relabel the templates, so flipping a mis-learned model would fix
+   * the opening position and corrupt every position after it. The templates
+   * have to be learned again.
+   */
+  /**
+   * Stop before the first frame is judged, without leaving a capture daemon, a
+   * Stockfish process and an always-on-top window behind.
+   *
+   * The two refusals below need the templates and one frame to reach their
+   * verdict, so by the time they can be made everything is already up and the
+   * ordinary `shutdown` path — which is bound to SIGINT and closes over state
+   * declared further down — is not reachable yet. Hence an explicit teardown in
+   * the same order.
+   */
+  const refuse = async () => {
+    overlay.quit();
+    await engine.quit();
+    await cap.quit();
+    dash.stop();
+    await log.close();
+    process.exitCode = 1;
+  };
+
+  /*
+   * Refused, not warned.
+   *
+   * Calibration checks this before writing, so nothing it produces can fail
+   * here — but a board.json written before that check existed still starts a
+   * session, and two of them did. The templates label the dark men "White", so
+   * the colour names are inverted in the only place the truth is recorded;
+   * every later check is then made of the same mistake and agrees with it, and
+   * the whole game is graded for the opponent. Playing on is worse than not
+   * playing: the coach is confidently wrong for an hour and the log cannot say
+   * so, because the log is written in the same inverted terms.
+   *
+   * Flipping is not the repair. `flipped` rotates the board mapping; it does not
+   * relabel the templates, so it would fix the opening position and corrupt
+   * every position after it. The templates have to be learned again.
+   */
+  const tone = inkTone(model);
+  if (tone.consistent === false && tone.separation >= model.contrast * INK_MARGIN_RATIO) {
+    console.error('\nThese templates have the two sides the wrong way round — what they call');
+    console.error(`White is drawn darker (${tone.white.toFixed(0)}) than what they call Black`
+      + ` (${tone.black.toFixed(0)}), by ${tone.separation.toFixed(0)} levels.`);
+    console.error('Every move would be graded for the wrong player, and the log would record');
+    console.error('the same mistake, so nothing afterwards could tell you it had happened.');
+    console.error('\nRe-run `npm run calibrate` — it checks this before writing. Flipping the');
+    console.error('board will not fix it: the templates themselves have to be learned again.');
+    await refuse();
+    return;
+  }
+
+  /*
+   * Also refused, for the same reason: it is not recoverable by anything the
+   * session can do. A theme or piece-set change leaves every template describing
+   * a board that is no longer on screen, and the drift is measured in the one
+   * part of a board no position can alter — the levels of its empty middle
+   * ranks. Six sessions ran on a drift of 14.4 against a bar of 10.0, and the
+   * message that told them so scrolled past before the first move; not one of
+   * them graded anything, and one sat lost for nineteen minutes.
+   *
+   * It also disables the rung that would otherwise have saved them, which is
+   * why warning is not enough. A new game is recognised by the start position
+   * probing at *zero* squares wrong; under a changed theme the same physical
+   * board probes at twelve, so the coach can neither track the game nor notice
+   * the next one beginning.
+   */
+  if (stale0?.stale) {
+    console.error(`\nThis is not the board that was calibrated. Its empty squares are`);
+    console.error(`${stale0.light >= 0 ? '+' : ''}${stale0.light.toFixed(0)} light and`
+      + ` ${stale0.dark >= 0 ? '+' : ''}${stale0.dark.toFixed(0)} dark against the templates`
+      + ` (drift ${stale0.drift.toFixed(1)}).`);
+    console.error('Nothing would grade: every piece would be measured against the appearance of');
+    console.error('a different theme, and a new game could not be recognised either.');
+    console.error('\nYou changed board theme or piece set. Re-run `npm run calibrate`.');
+    await refuse();
+    return;
+  }
   console.log('log:    move (SAN), grade, evaluation in pawns, win% lost — see README > Notation');
   console.log('Coach:  t  what is he threatening');
   console.log('        w  what is weak in your position');
@@ -128,6 +328,10 @@ async function main() {
   console.log('        press on the overlay window, or type here + Enter.');
   console.log('        press again for more on the same question. None name your move.');
   if (log.enabled) console.log(`log:    this session is being recorded to ${log.dir}`);
+  if (dash.url) console.log(`review: ${dash.url} — open it once; it updates as you play`);
+  else if (process.env.COACH_DASHBOARD !== '0') {
+    console.log('review: the dashboard could not take a port; reviews still go to reports/');
+  }
   console.log('Ctrl+C to stop.\n');
 
   let stopping = false;
@@ -136,6 +340,96 @@ async function main() {
   let keys = null;
   /** Which game of this session we are on; see `tryNewGame`. */
   let games = 1;
+
+  /*
+   * The graded moves of the game in progress, kept for the review.
+   *
+   * Kept here rather than read back out of the log afterwards because we
+   * already have them: `gradeMove` returns everything the review needs, and a
+   * session that was started with `COACH_LOG=0` has no log to read back. Reset
+   * when a new game starts, so one game's blunders never land in the next
+   * game's report.
+   */
+  let graded = [];
+  /** Games of this session already finished and reviewed. */
+  const reviews = [];
+
+  /**
+   * Everything reviewable about this session right now, finished games first
+   * and the one in progress last.
+   *
+   * The game being played is included deliberately. A review you can only read
+   * once the game is over is a review you read when you have stopped caring;
+   * the moment it is worth seeing is two moves after you dropped a piece, and
+   * that means the page has to know about a game that has not ended. It is the
+   * same entry throughout — `n` does not change — so when the game does end it
+   * is replaced rather than added beside itself.
+   */
+  const snapshot = () => {
+    const session = log.dir ? path.basename(log.dir) : 'session';
+    const all = [...reviews];
+    if (graded.length) {
+      all.push({
+        ...reviewGame(graded, { color: playerColor }),
+        n: games, plies: chess.history().length, source: 'live', playing: true,
+      });
+    }
+    return all.map((g) => ({
+      ...g,
+      id: `${session}#${g.n}`,
+      session,
+      title: titleOf(session, g.n, all.length),
+    }));
+  };
+
+  /**
+   * Write the session's reviews out, and refresh anything watching.
+   *
+   * Wrapped whole, because nothing here is worth a session for. A review that
+   * throws must not take the shutdown or the watch loop with it, and a full
+   * disk is a reason to lose a report rather than a reason to lose the game
+   * being played. Same rule `log.js` runs under.
+   */
+  const publish = () => {
+    try {
+      const all = snapshot();
+      if (log.dir && all.length) saveReview(log.dir, all);
+      dash.notify();
+    } catch (e) {
+      console.error('review failed (the game itself is safe in the log):', e.message);
+    }
+  };
+
+  /** A game has ended: keep its review, and start the next one clean. */
+  const finishGame = (n) => {
+    if (!graded.length) return null;
+    let r = null;
+    try {
+      r = reviewGame(graded, { color: playerColor });
+      reviews.push({ ...r, n, plies: chess.history().length, source: 'live' });
+      graded = [];
+    } catch (e) {
+      console.error('review failed (the game itself is safe in the log):', e.message);
+      graded = [];
+      return null;
+    }
+    publish();
+    return r;
+  };
+
+  /** Print a finished game's review, and say where the rest of it lives. */
+  const showReview = (r) => {
+    if (!r) return;
+    console.log('\nhow that went:');
+    for (const line of summarise(r)) console.log(line);
+    if (dash.url) return void console.log(`  the full review: ${dash.url}`);
+    try {
+      console.log(`  the full review, and every other game: ${rebuild().file}`);
+    } catch (e) {
+      console.error('  (could not write the review page:', e.message + ')');
+    }
+  };
+
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
@@ -147,6 +441,10 @@ async function main() {
     // exactly the ones from just before you gave up and pressed Ctrl+C.
     log.event('end', { fen: chess.fen(), moves: chess.history().length, games });
     log.pgn(chess.pgn(), games);
+    showReview(finishGame(games));
+    // After the last review is written, so a tab open on the dashboard gets the
+    // finished game pushed to it before the server goes away.
+    dash.stop();
     await log.close();
     process.exit(0);
   };
@@ -161,12 +459,6 @@ async function main() {
     console.warn('note: no fit floor in board.json — re-run `npm run calibrate` for');
     console.warn('      stricter move acceptance.\n');
   }
-  // Written by calibration, which measures it off this board. The fallback is
-  // for a board.json from before that existed: the contrast term alone is a
-  // reasonable limit, just not one tuned to this theme.
-  const squareLimit = cfg.squareLimit ?? (model.contrast * 0.15) ** 2;
-  /** Derived, not calibrated: a multiple of the limit above. See {@link SOFT_SLACK}. */
-  const softLimit = squareLimit * SOFT_SLACK;
 
   /*
    * The session record. Everything below that prints a line to the terminal
@@ -178,6 +470,22 @@ async function main() {
     region: cfg.region,
     flipped: model.flipped,
     playerColor,
+    /*
+     * Where that colour came from, rather than only what it is. Four sessions'
+     * logs recorded `playerColor: 'b'` as a bare fact and so could not answer
+     * the one question being asked of them afterwards — why does it think that?
+     * `calibrated` is what the templates were built with and what decided it;
+     * `facing` is what the board itself said at startup.
+     */
+    orientation: {
+      calibrated: model.orientation,
+      facing: facing0,
+      theme: stale0,
+      // Measured from the loaded templates, so it is present even for a
+      // model.json written before calibration recorded its reasons.
+      tone: { white: tone.white, black: tone.black,
+              separation: tone.separation, consistent: tone.consistent },
+    },
     fen: chess.fen(),
     model: fileHash(path.join(TEMPLATE_DIR, 'model.json')),
     contrast: model.contrast,
@@ -224,13 +532,26 @@ async function main() {
    * on, and both read the same numbers so the log cannot disagree with the
    * decision it explains.
    */
-  const probeStart = (det) => {
+  const probeStart = (det, asFlipped = model.flipped) => {
     const out = {};
-    // Keyed by how it relates to the orientation we are *currently reading in*,
-    // not to an absolute one: for a player sitting on the black side, `same` is
-    // already a flipped grid, and labelling it "the other way round" in the
-    // summary inverts the meaning of the one line that has to be unambiguous.
-    for (const [key, flipped] of [['same', model.flipped], ['turned', !model.flipped]]) {
+    /*
+     * Keyed by how it relates to the orientation we are *currently reading in*,
+     * not to an absolute one: for a player sitting on the black side, `same` is
+     * already a flipped grid, and labelling it "the other way round" in the
+     * summary inverts the meaning of the one line that has to be unambiguous.
+     *
+     * Which is exactly why the reference is a parameter. `tryFlip` toggles
+     * `model.flipped` before proving the toggle, and calls `tryRead` while it is
+     * toggled — so reading the live flag there labelled `same` and `turned`
+     * backwards relative to every other event in the log. It was silent and
+     * total: the same pair of numbers appears twice in an episode with the labels
+     * swapped, and on one session the summary reported the start position
+     * matching "the other way round" for a board being read the right way round,
+     * sending the diagnosis after a flip that never happened. Callers inside a
+     * speculative toggle pass the orientation the reader should be described
+     * against.
+     */
+    for (const [key, flipped] of [['same', asFlipped], ['turned', !asFlipped]]) {
       const grid = fenToGrid(START_FEN, flipped);
       out[key] = {
         score: Math.round(model.scoreGrid(det.table, grid, det.mask) * 10) / 10,
@@ -350,9 +671,12 @@ async function main() {
     const mine = mover === playerColor;
     const tag = recovered ? (mine ? 'you~' : 'opp~')
       : mine ? (usedHint ? 'you*' : 'you ') : 'opp ';
+    // Read here, not inside the grade below: that runs a search later, by which
+    // time the game has moved on and every move would be numbered wrongly.
+    const ply = chess.history().length;
     log.event('apply', {
       tag: tag.trim(), san: move.san, uci, mover, recovered, usedHint,
-      fenBefore, fenAfter: chess.fen(), ply: chess.history().length,
+      fenBefore, fenAfter: chess.fen(), ply,
     });
     if (!mine && !args.all) return void console.log(`[${tag}] ${move.san}`);
 
@@ -364,10 +688,32 @@ async function main() {
         ? { fen: coach.fen, analysis: coach.analysis } : null;
 
       const g = await gradeMove(engine, fenBefore, uci, DEPTH, { pre });
-      log.event('grade', {
-        san: g.san, label: g.label.name, drop: g.drop,
-        scoreBefore: g.scoreBefore, scoreAfter: g.scoreAfter, cached: !!pre,
-      });
+
+      /*
+       * Everything the review needs, written as it goes past.
+       *
+       * The extra fields are what let a game be reviewed *without* an engine
+       * afterwards — the positions and the lines Stockfish returned are the
+       * whole evidence `review.js` classifies from, and a search that is not
+       * recorded here has to be paid for again. The lines are cut at 8 plies:
+       * ~300 bytes a move, against the 16KB frame this same loop already
+       * records six times a second.
+       */
+      const row = {
+        san: g.san, uci, mover: g.mover, ply,
+        label: g.label.name, drop: g.drop,
+        scoreBefore: g.scoreBefore, scoreAfter: g.scoreAfter,
+        fenBefore: g.fenBefore, fenAfter: g.fenAfter,
+        bestMove: g.bestMove, bestLine: (g.bestLine ?? []).slice(0, 8),
+        refutation: (g.refutation ?? []).slice(0, 8), materialSwing: g.materialSwing,
+        exchange: g.exchange, floored: g.floored,
+      };
+      if (mine) graded.push(row);
+      log.event('grade', { ...row, cached: !!pre });
+      // The dashboard follows the game rather than waiting for it to end.
+      // Cheap — a review of the moves in hand, and a rebuild of a few KB of
+      // JSON — and it runs on the grading queue, never the watch loop.
+      if (mine) publish();
       console.log(`[${tag}] ${g.san.padEnd(7)} ${g.label.name.padEnd(11)}`
         + ` ${formatScore(g.scoreBefore)} -> ${formatScore(g.scoreAfter)}`
         + `  (-${g.drop.toFixed(1)}%)`);
@@ -477,14 +823,17 @@ async function main() {
     const found = model.replaceLast(det.table, chess, {
       mask: combine(det.mask, det.stale), squareLimit, tint: det.tint, softLimit,
     });
-    const beats = found ? det.still - found.score : 0;
-    if (!found || found.misfits > 0 || found.margin < watcher.confidence
+    // `no` is set when the rung declined before ranking anything, and says which
+    // of the four ways it was — see BoardModel.replaceLast.
+    const ran = found && !found.no;
+    const beats = ran ? det.still - found.score : 0;
+    if (!ran || found.misfits > 0 || found.margin < watcher.confidence
         || beats <= MOVE_THRESHOLD) {
       log.event('replace', {
         ok: false,
-        reason: !found ? 'no move' : found.misfits > 0 ? 'misfits'
+        reason: !ran ? found.no : found.misfits > 0 ? 'misfits'
           : found.margin < watcher.confidence ? 'margin' : 'threshold',
-        was: found?.was.san ?? null, now: found?.move.san ?? null,
+        was: found?.was?.san ?? null, now: found?.move?.san ?? null,
         score: found?.score, misfits: found?.misfits, margin: found?.margin,
         beats, need: watcher.confidence,
         wrong: diagnose(det), start: probeStart(det),
@@ -604,6 +953,9 @@ async function main() {
     // Written before the position is thrown away: this is the only record that
     // the game just finished ever happened.
     const saved = log.pgn(chess.pgn(), games);
+    // Reviewed here for the same reason, and before `playerColor` may flip
+    // below: the game that just ended was played from the side we are on now.
+    const review = finishGame(games);
     games += 1;
 
     // The other side of the board is as likely as the same one. Orientation and
@@ -613,11 +965,37 @@ async function main() {
       playerColor = model.flipped ? 'b' : 'w';
     }
 
+    /*
+     * And then confirmed against the board rather than left to the probe.
+     *
+     * `verdict.turned` comes from which way round the opening position fitted
+     * better, which is a comparison between two hypotheses; this is a reading
+     * of where the two colours actually are. They agree on a clean board, and
+     * when they do not it is this one that is right — a new game is the moment
+     * the site hands you the other colour, so it is exactly the moment worth
+     * spending a second opinion on. Costs nothing: the frame is already scored.
+     */
+    const facing = facingOf(det);
+    const turnedBy = facing.flipped != null && facing.margin >= ORIENTATION_MARGIN
+      && facing.flipped !== model.flipped;
+    if (turnedBy) {
+      model.flipped = facing.flipped;
+      playerColor = model.flipped ? 'b' : 'w';
+    }
+    log.event('facing', {
+      at: 'newgame', flipped: facing.flipped, margin: facing.margin,
+      changed: turnedBy, agreed: !turnedBy && facing.flipped === model.flipped,
+    });
+
     chess.reset();
     lastMove = null;
     Object.assign(coach, { fen: null, analysis: null, threat: null, step: {}, taken: false });
     if (chess.turn() === playerColor) preAnalyse(chess.fen());
     watcher.reset();
+    // A rematch on the same board keeps its floor; one handed to you the other
+    // way round does not, and this is the exact frame that invalidated it on the
+    // session that lost half an hour to a stale one.
+    if (verdict.turned) watcher.relearnFloor();
 
     log.event('newgame', {
       ok: true, game: games, turned: verdict.turned, flipped: model.flipped,
@@ -629,6 +1007,7 @@ async function main() {
       + ' Starting over at move 1.');
     console.log(`(the last game ran ${plies} ${plies === 1 ? 'ply' : 'plies'} here`
       + `${saved ? `, kept as ${saved}` : ''})`);
+    showReview(review);
     return true;
   };
 
@@ -683,7 +1062,14 @@ async function main() {
    * guarantee the rest of the design buys: that the tracked position got here
    * through legal moves we actually watched.
    */
-  const tryRead = (det) => {
+  /**
+   * @param {object} det
+   * @param {boolean} [describeAs]  the orientation this call's log lines should
+   *        be labelled against. `tryFlip` reaches here with `model.flipped`
+   *        already toggled to a value it has not yet proved, and passes the
+   *        orientation the rest of the log is written in — see {@link probeStart}.
+   */
+  const tryRead = (det, describeAs = model.flipped) => {
     const fenWas = chess.fen();
     if (det.occluded > 0) {
       log.event('read', { ok: false, reason: 'occluded', occluded: det.occluded });
@@ -691,7 +1077,12 @@ async function main() {
     }
     const read = model.readBoard(det.tint, { squareLimit, mask: det.mask });
     if (!read) {
-      log.event('read', { ok: false, reason: 'ambiguous', start: probeStart(det) });
+      log.event('read', {
+        ok: false, reason: 'ambiguous', start: probeStart(det, describeAs),
+        // Said outright, because the numbers alone cannot show it: this reading
+        // was taken in a speculative orientation that may be reverted.
+        ...(describeAs === model.flipped ? {} : { speculative: true }),
+      });
       return false;
     }
 
@@ -790,7 +1181,10 @@ async function main() {
     // Either the position was right all along and only the view was wrong, or
     // the board also ran ahead while we were making no sense of it — in which
     // case a clean read is itself the proof that this way round is the right one.
-    const proven = misfits === 0 || tryRead(det);
+    // `was` is the orientation every other line of this episode is written in,
+    // so the read's own log lines are labelled against it rather than against the
+    // toggle we are still trying to prove.
+    const proven = misfits === 0 || tryRead(det, was === 'b');
     if (!proven) {
       log.event('flip', { ok: false, misfits, tried: model.flipped });
       model.flipped = !model.flipped;
@@ -798,6 +1192,11 @@ async function main() {
       return false;
     }
     log.event('flip', { ok: true, misfits, flipped: model.flipped, playerColor });
+    // The board turned round, so the floor no longer measures it — see
+    // MoveWatcher.relearnFloor. board.json is deliberately left alone: the
+    // orientation is a property of this game, and the next clean frame supplies
+    // the number for this one.
+    watcher.relearnFloor();
 
     const name = playerColor === 'w' ? 'White' : 'Black';
     console.log(`\nthe board is the other way round from the one calibrated — you are`
@@ -855,9 +1254,24 @@ async function main() {
 
   /** Runs each rung once per episode; see {@link Ladder} for why that is not free. */
   const ladder = new Ladder();
-  const due = (at) => ladder.due(watcher.lost, at);
+  /*
+   * How many squares are wrong right now, which stands in for *which* ones are.
+   * A coarse proxy deliberately: when the board runs on by another ply the count
+   * essentially always changes, and comparing counts costs nothing, where
+   * carrying the set of squares around would cost an allocation every frame on
+   * the one path that must not get slower. See {@link Ladder#due}.
+   */
+  let shape = null;
+  const due = (at) => ladder.due(watcher.lost, at, shape);
   /** Whether this episode has already reported a refused new game. */
   let nearMiss = false;
+  /**
+   * Whether this spell of blindness has already been escalated. A flag rather
+   * than an exact frame count, because re-measuring the region takes about a
+   * second and `blind` does not advance while it runs — the same stall that made
+   * the ladder fire one search thirteen times.
+   */
+  let blindGaveUp = false;
 
   while (!stopping) {
     const t0 = Date.now();
@@ -883,6 +1297,26 @@ async function main() {
     });
     const detected = Date.now();
     const accepted = watcher.feed(frame, det);
+    shape = det.stillMisfits;
+
+    /*
+     * board.json describing a board that is no longer on screen used to be
+     * invisible. It does not stop moves being read — the per-square count does
+     * that job and does it on this board's own terms — but every limit derived
+     * from `floor` is then quietly wrong, and the session that found this ran
+     * 210 seconds with a floor 4.4x too low without saying a word.
+     *
+     * Said once, after enough accepted moves to be sure it is the calibration
+     * and not one decorated frame, and phrased as the action it implies.
+     */
+    if (watcher.overFloor === STALE_FLOOR_MOVES) {
+      console.log(`\nthe board reads cleanly but costs more than calibration said it would`
+        + ` (floor ${cfg.floor}).`);
+      console.log('Nothing is wrong with the grading — moves are judged per square, not by');
+      console.log('that number — but board.json describes a different board: a changed theme,');
+      console.log('piece set, or board size. Re-run `npm run calibrate` when convenient.');
+      watcher.overFloor++;                         // so this fires once, not every move
+    }
 
     /*
      * The frame goes in before the move is applied, so `fen` is the position
@@ -960,12 +1394,54 @@ async function main() {
       console.warn('the pieces are not the ones it learned.\n');
     }
 
+    // One escalation per spell of blindness, re-armed when the board comes back.
+    // Kept here with the rest of the blindness bookkeeping and deliberately not
+    // above the ladder: written there it became the head of the ladder's own
+    // if/else chain, which gated every rung on `blind !== 0` — on being unable to
+    // read the board, the one state in which no rung can prove anything. The
+    // session that found it lost sync at 23.7s and got its first recovery attempt
+    // at 589.4s, when the game ended and a dialog finally covered the board.
+    if (watcher.blind === 0) blindGaveUp = false;
+
     // Being unable to see the board is not the same as having lost it, and the
     // difference matters: this clears on its own, so it is worth saying once
     // rather than doing nothing visible while a dialog sits there.
     if (watcher.blind === BLIND_AFTER) {
       log.event('blind', { occluded: det.occluded });
       console.log('(something is covering the board — waiting for it to clear)');
+    }
+
+    /*
+     * Waiting is right for a dialog and wrong for a region that is not a board.
+     *
+     * The occlusion path holds rather than counting itself lost, which is
+     * correct — a promotion picker clears. But nothing ever gave up on it, and
+     * "covered" and "there is no board here" are indistinguishable from the
+     * inside: a blank surface still satisfies the *empty*-square hypothesis on
+     * the 32 empty squares, so `occluded` pins at exactly 32, never approaches
+     * 64, and never looks total. Measured on a real session: 122 seconds and 784
+     * frames of a region holding a flat white surface — zero contrast between
+     * the two square shades, which no chess board can have — with `blind`
+     * reaching 744 against this budget of 40, not one `desync` event emitted, no
+     * rung ever run, and `log-summary` afterwards reporting "Nothing went wrong
+     * in this session."
+     *
+     * So a board still unreadable long after anything modal would have cleared
+     * is treated as a region problem, which is a thing the ladder can actually
+     * act on: re-measure it, and if that finds nothing, say so instead of
+     * waiting out the rest of the session in silence.
+     */
+    if (watcher.blind >= BLIND_LOST && !blindGaveUp) {
+      blindGaveUp = true;
+      const secs = (watcher.blind * POLL_MS / 1000).toFixed(0);
+      log.event('blind', { occluded: det.occluded, at: 'escalate', frames: watcher.blind });
+      console.log(`\nthe board has been unreadable for about ${secs}s — longer than a dialog.`);
+      if (!await tryRegion()) {
+        console.log('Re-measuring the region found no grid either, so this is probably not');
+        console.log('the board any more: it was closed, moved to another screen, or the');
+        console.log('region was never right. `npm run calibrate` re-measures it.');
+        console.log('(still watching, in case it comes back)');
+      }
     }
 
     const elapsed = Date.now() - t0;

@@ -38,6 +38,34 @@ test("the engine's own top move is graded Best", async () => {
   assert.equal(g.label, LABELS.BEST, `graded ${g.label.name}`);
 });
 
+/*
+ * The real position this was found in: logs/2026-09-30T20-09-59, move 39, Black.
+ * Two mates are available — Rxf1# and Qxf1# — so the engine picks one and the
+ * other is not `playedBest`. Graded through the score alone, mating with the
+ * queen came back **Blunder, -100%**, because UCI answers `mate 0` for a mated
+ * board and negating that gives `-0`.
+ */
+const MATE_IN_ONE = '4kr2/1p5p/2p1p3/2b3pP/4R3/8/r7/2q2N1K b - - 4 39';
+
+test('mating with the move the engine did not pick is still not a blunder', async () => {
+  const { bestmove } = await engine.analyse(MATE_IN_ONE, 12);
+  // The premise: the engine prefers the rook, so the queen mate is not Best by
+  // accident. If Stockfish ever changes its mind the test still holds.
+  const other = bestmove === 'f8f1' ? 'c1f1' : 'f8f1';
+  const g = await gradeMove(engine, MATE_IN_ONE, other, 12);
+  assert.match(g.san, /#$/, `expected a mating move, got ${g.san}`);
+  assert.equal(g.drop, 0, `mating cost ${g.drop.toFixed(1)}% of the win probability`);
+  assert.equal(g.label, LABELS.BEST, `graded ${g.label.name}`);
+});
+
+test('a mating move is not searched past the end of the game', async () => {
+  const g = await gradeMove(engine, MATE_IN_ONE, 'f8f1', 12);
+  assert.equal(g.label, LABELS.BEST);
+  // Nothing to punish and nothing to quote: the board has no continuation.
+  assert.deepEqual(g.refutation, []);
+  assert.equal(g.winAfter, 100);
+});
+
 test('a MultiPV search reports the best line first, and a worse runner-up', async () => {
   const r = await engine.analyse(HANGING, 12, { multipv: 2 });
   assert.equal(r.lines.length, 2, 'expected two lines');

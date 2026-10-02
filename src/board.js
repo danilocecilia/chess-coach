@@ -185,6 +185,36 @@ export function fenToGrid(fen, flipped) {
   return gridOf(new Chess(fen), flipped);
 }
 
+/**
+ * The position calibration learns from. Named here as well as in calibrate.js
+ * because a model written before `oneShade` was recorded has to have it derived,
+ * and this is the only position it could have been learned from.
+ */
+export const LEARNED_FROM = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
+/**
+ * Which piece codes stand on only one square shade in `fen`, and which shade.
+ *
+ * Those are the pieces whose opacity cannot be solved, only estimated — see
+ * {@link BoardModel.shadeAllowance}. In the opening it is exactly the four
+ * kings and queens, but it is derived rather than asserted so that a model
+ * learned from some other position still describes itself correctly.
+ */
+export function oneShadeCodes(fen) {
+  const grid = fenToGrid(fen, false);
+  const seen = {};
+  for (let idx = 0; idx < 64; idx++) {
+    if (grid[idx] === 0) continue;
+    const [r, c] = toBoardCoords(idx, false);
+    (seen[CODES[grid[idx]]] ??= new Set()).add(shadeOf(r, c));
+  }
+  const out = {};
+  for (const [code, shades] of Object.entries(seen)) {
+    if (shades.size === 1) out[code] = [...shades][0];
+  }
+  return out;
+}
+
 /** 64 piece-code indices in image order -> the placement field of a FEN. */
 export function gridToPlacement(grid, flipped) {
   const rows = [];
@@ -223,6 +253,120 @@ export function detectFlipped(frame) {
   const top = bandMean([0, 1]);      // far side
   const bottom = bandMean([6, 7]);   // near side
   return { flipped: top > bottom, top, bottom };
+}
+
+/**
+ * Which side the learned templates are calling White, measured from the men.
+ *
+ * This is the one orientation question that cannot be answered by asking how
+ * well a model fits. {@link BoardModel.learn} fits its templates to whatever
+ * pixels sit under the grid it was handed, so a model learned the wrong way
+ * round reproduces its own calibration frame *exactly* as well as the right one
+ * — measured on four real boards across two themes, the two fits came out
+ * bit-identical, to every digit a double carries. A comparison whose answer is
+ * always a tie is not a weak test, it is no test: the winner is then whichever
+ * the sort happened to leave first, and orientation is decided by nothing.
+ *
+ * That mattered. A session calibrated the templates with the colours swapped,
+ * every later check agreed with the mistake because the mistake was baked into
+ * the templates that the checks are made of, and the coach spent a game telling
+ * a Black player they were White and grading their opponent's moves.
+ *
+ * `ink` is the piece's own colour with the square behind it already divided out
+ * (see pass 3 of `learn`), so this asks about the men alone — never about the
+ * board they stand on, never about the frame they came from. A piece set draws
+ * White lighter than Black, which is the one assumption here and a safe one: a
+ * set that broke it would be unreadable to the player too.
+ *
+ * Weighted by opacity because a transparent pixel is showing the square, not
+ * the piece, and averaging it in would drag both sides towards the background.
+ *
+ * @param {BoardModel} model  a trained model
+ * @returns {{consistent: boolean|null, separation: number,
+ *            white: number|null, black: number|null}}
+ *          `consistent` is true when White's men really are the lighter ones,
+ *          i.e. the model's `flipped` is right; null when a side has no
+ *          templates at all. `separation` is how far apart the two sides are
+ *          drawn, which is the confidence.
+ */
+export function inkTone(model) {
+  const tone = (side) => {
+    let sum = 0, weight = 0;
+    for (const [code, p] of Object.entries(model.piece)) {
+      if (code[0] !== side) continue;
+      for (let i = 0; i < SQ_BYTES; i++) {
+        sum += p.ink[i] * p.opacity[i];
+        weight += p.opacity[i];
+      }
+    }
+    return weight ? sum / weight : null;
+  };
+  const white = tone('w'), black = tone('b');
+  if (white == null || black == null) return { consistent: null, separation: 0, white, black };
+  return { consistent: white > black, separation: Math.abs(white - black), white, black };
+}
+
+/**
+ * How far apart the two sides must be drawn before {@link inkTone} is believed,
+ * as a fraction of the board's own light/dark contrast.
+ *
+ * Scaled from contrast rather than fixed, for the same reason `allow` and
+ * `squareLimit` are: it has to mean the same thing on a high-contrast wood
+ * theme and a flat grey one. A quarter is deliberately loose — on a real board
+ * the measured separation was 102.4 against a bar of 24, and anything close to
+ * the bar is a board this test should decline to rule on rather than guess.
+ */
+export const INK_MARGIN_RATIO = 0.25;
+
+/**
+ * Board-level shift, as a fraction of the board's own contrast, past which the
+ * templates are not describing the board on screen. See
+ * {@link BoardModel.themeDrift}.
+ *
+ * A tenth is well clear of the couple of grey levels an unchanged board wanders
+ * by between sessions, and well under the ~14 measured when a real theme change
+ * broke four sessions in a row on a board of contrast ~97.
+ */
+export const THEME_DRIFT_RATIO = 0.1;
+
+/**
+ * Which way round to calibrate, from one frame of the start position.
+ *
+ * Two independent readings, because each fails differently. {@link inkTone}
+ * asks which men are drawn lighter and knows nothing about where they stand;
+ * {@link detectFlipped} asks which end of the board is brighter and knows
+ * nothing about which men are which. A dark piece set on a light theme fools
+ * the second; a set with no tonal difference between the sides defeats the
+ * first. They are wrong in different places, so agreement is worth something
+ * and disagreement is worth stopping for.
+ *
+ * Only one model has to be built. The two candidates are exact mirrors of each
+ * other — flipping relabels which code was learned from which square, so the
+ * inks simply swap — which means a model built either way round answers the
+ * question, and the answer for the other way round is its negation.
+ *
+ * @param {BoardModel} trial   a model learned from `frame` with *any* `flipped`
+ * @param {Uint8Array} frame   the calibration frame
+ * @returns {{flipped: boolean|null, ink: object, brightness: object,
+ *            agree: boolean, decisive: boolean, bar: number}}
+ *          `flipped` is null when the two disagree or the ink is too close to
+ *          call, which is a refusal to answer and not a default.
+ */
+export function chooseOrientation(trial, frame) {
+  const ink = inkTone(trial);
+  const brightness = detectFlipped(frame);
+  const bar = (trial.contrast ?? 0) * INK_MARGIN_RATIO;
+  // `consistent` is about the model we were handed, so the orientation it
+  // implies is that model's own flag when the ink agrees with it, and the
+  // opposite when it does not.
+  const byInk = ink.consistent == null ? null
+    : ink.consistent ? trial.flipped : !trial.flipped;
+  const decisive = byInk != null && ink.separation >= bar;
+  const agree = byInk != null && byInk === brightness.flipped;
+  return {
+    flipped: decisive && agree ? byInk : null,
+    byInk, ink, brightness, agree, decisive, bar,
+  };
 }
 
 /**
@@ -276,6 +420,13 @@ export const ORIENTATION_MARGIN = 1;
 export class BoardModel {
   constructor({ flipped = false } = {}) {
     this.flipped = flipped;
+    /**
+     * What decided `flipped`, kept so a session can say where its orientation
+     * came from instead of stating it as a bare fact. Written by calibration
+     * via {@link chooseOrientation}; null on a model built for a trial fit or
+     * loaded from a file predating it.
+     */
+    this.orientation = null;
     this.empty = { light: null, dark: null };  // mean appearance of a bare square
     /**
      * Bare appearance of one specific square, where the start position left it
@@ -288,6 +439,16 @@ export class BoardModel {
      */
     this.bare = new Array(64).fill(null);
     this.piece = {};                            // piece code -> { opacity, ink }
+    /**
+     * Pieces whose opacity was *guessed* rather than solved, and the single
+     * square shade they were seen on. Only the king and queen reach this in a
+     * normal calibration: every other piece type stands on both square colours
+     * in the opening, which makes both unknowns solvable exactly.
+     * Read by {@link slackFor}.
+     */
+    this.oneShade = {};
+    /** Memoised {@link shadeAllowance}; cleared whenever templates change. */
+    this._allow = null;
     /** Light/dark separation, which sets every threshold that scales with theme. */
     this.contrast = 0;
     this.trained = false;
@@ -364,9 +525,14 @@ export class BoardModel {
 
     // Pass 3: solve opacity and ink.
     this.piece = {};
+    this.oneShade = {};
+    this._allow = null;
     for (const [code, m] of Object.entries(mean)) {
       const both = m.light && m.dark;
       const shade = m.light ? 'light' : 'dark';
+      // Recorded, not inferred later: what the guess was allowed to cost is
+      // judged against the shade this piece was actually seen on.
+      if (!both) this.oneShade[code] = shade;
       const other = shade === 'light' ? 'dark' : 'light';
       const obs = m.light ?? m.dark;
       const twin = mean[(code[0] === 'w' ? 'b' : 'w') + code.slice(1)];
@@ -413,12 +579,14 @@ export class BoardModel {
       // refused with an instruction rather than silently mispredicting.
       version: MODEL_VERSION,
       flipped: this.flipped,
+      orientation: this.orientation,
       contrast: this.contrast,
       empty: { light: Array.from(this.empty.light), dark: Array.from(this.empty.dark) },
       bare: this.bare.map((b) => (b ? Array.from(b) : null)),
       piece: Object.fromEntries(Object.entries(this.piece).map(([k, v]) => [k, {
         opacity: Array.from(v.opacity), ink: Array.from(v.ink),
       }])),
+      oneShade: this.oneShade,
     };
   }
 
@@ -428,6 +596,9 @@ export class BoardModel {
         + '\nRe-run `npm run calibrate`.');
     }
     const m = new BoardModel({ flipped: o.flipped });
+    // Absent in models written before orientation recorded its reasons; the
+    // session log then says so rather than inventing a provenance.
+    m.orientation = o.orientation ?? null;
     m.empty = { light: Float32Array.from(o.empty.light), dark: Float32Array.from(o.empty.dark) };
     m.bare = (o.bare ?? []).map((b) => (b ? Float32Array.from(b) : null));
     while (m.bare.length < 64) m.bare.push(null);
@@ -435,8 +606,60 @@ export class BoardModel {
     m.piece = Object.fromEntries(Object.entries(o.piece).map(([k, v]) => [k, {
       opacity: Float32Array.from(v.opacity), ink: Float32Array.from(v.ink),
     }]));
+    /*
+     * Derived rather than defaulted to nothing when a model predates the field.
+     * The allowance is computed from the templates themselves, so an older
+     * board.json can have it without being re-learned — and defaulting to `{}`
+     * would silently leave exactly the boards already on disk unprotected.
+     */
+    m.oneShade = o.oneShade ?? oneShadeCodes(LEARNED_FROM);
+    m._allow = null;
     m.trained = true;
     return m;
+  }
+
+  /**
+   * How far this frame's board is from the one the templates were learned on.
+   *
+   * Asked of the empty middle ranks only, and of their *levels* rather than
+   * their pixels, because that is the part of the board no position can change:
+   * whatever is being played, ranks 3 to 6 of a chess board are mostly bare
+   * squares, and their light and dark means are a property of the skin.
+   *
+   * The case this exists for is a board theme changed between sessions. Nothing
+   * then fits, every hypothesis is refused for the right reasons, and the coach
+   * spends the game correctly concluding it is lost — while the actual answer,
+   * "these templates are for a different board", is deducible in one frame. On
+   * a real session that cost 160 lost frames and 35 seconds before anything was
+   * said, and what it said arrived on the console while the overlay still read
+   * "Waiting for a move...".
+   *
+   * Reported, never acted on: a drift this large is a reason to tell someone,
+   * not a reason for the watcher to behave differently.
+   *
+   * @returns {{light: number, dark: number, drift: number, stale: boolean}}
+   *          `drift` is the larger of the two level shifts, `stale` whether it
+   *          is big enough that the templates cannot be describing this board.
+   */
+  themeDrift(frame) {
+    const mean = (idx) => {
+      const tile = square(frame, idx);
+      let sum = 0;
+      for (let i = 0; i < SQ_BYTES; i++) sum += tile[i];
+      return sum / SQ_BYTES;
+    };
+    const avg = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
+    const seen = { light: [], dark: [] }, want = { light: [], dark: [] };
+    for (let idx = 16; idx < 48; idx++) {
+      const [r, c] = toBoardCoords(idx, this.flipped);
+      const sh = shadeOf(r, c);
+      seen[sh].push(mean(idx));
+      want[sh].push(avg(Array.from(this.bareAt(idx))));
+    }
+    const light = avg(seen.light) - avg(want.light);
+    const dark = avg(seen.dark) - avg(want.dark);
+    const drift = Math.max(Math.abs(light), Math.abs(dark));
+    return { light, dark, drift, stale: drift >= this.contrast * THEME_DRIFT_RATIO };
   }
 
   /** Bare appearance of one square: measured if we have it, else the shade mean. */
@@ -455,6 +678,132 @@ export class BoardModel {
     const out = new Float32Array(SQ_BYTES);
     for (let i = 0; i < SQ_BYTES; i++) out[i] = p.ink[i] + (1 - p.opacity[i]) * base[i];
     return out;
+  }
+
+  /**
+   * How far a guessed opacity may miss by on the shade it never saw — measured,
+   * not chosen.
+   *
+   * {@link learn} solves opacity exactly for a piece observed on both square
+   * colours and *estimates* it for one seen on a single colour: the king and
+   * queen, which stand on one square each in the opening. An estimate off by
+   * `e` per pixel costs `e * (bare_light - bare_dark)` the moment that piece
+   * steps onto the other shade — invisible at home, because the background it
+   * was fitted against is there to cancel it, and scaled by the whole board
+   * contrast away from it. Measured on a real session: the white queen, learned
+   * on light d1, cost 646 on dark e3 against a limit of 200. The right piece,
+   * three times too expensive, and one square wrong under every hypothesis is
+   * enough that no move can be accepted and no resync line comes back clean.
+   * That session lost 159 seconds and the game from a perfectly tracked
+   * position.
+   *
+   * The size of that error is not a mystery to be tuned around. It can be
+   * measured on this board, from the pieces that did not need the guess: hide
+   * one shade of a piece seen on both, guess its mask exactly as the king and
+   * queen's is guessed, predict the shade that was hidden, and score it. That
+   * is a leave-one-shade-out cross-validation of the estimator, and what it
+   * returns is the allowance the estimator has earned — which shrinks to
+   * nothing on a board where the guess happens to be good, and needs no
+   * constant.
+   *
+   * Kept per colour and per *target* shade, because the error is strongly
+   * asymmetric and the asymmetry is the mechanism: a piece drawn in the tone of
+   * the square it was learned on deviates from that square least, so its mask
+   * saturates, its opacity is overestimated, and only the opposite shade pays.
+   * On the board this was written against, white pieces learned on light missed
+   * dark squares by 331-574 while the same pieces learned on dark missed light
+   * ones by 29-132 — a factor of five, in one direction only. Averaging the two
+   * would excuse the safe direction and still refuse the queen.
+   *
+   * The maximum rather than a percentile: there are only four pieces to measure
+   * per direction, and the queen is the largest glyph on the board, so it
+   * covers more pixels than any of them and its own error is likely at or above
+   * theirs. This is the conservative end of a small sample, not a headroom
+   * multiplier.
+   *
+   * @returns {{w: {light: number, dark: number}, b: {light: number, dark: number}}}
+   *          mean-squared-error allowance, in the units {@link costTable} uses
+   */
+  shadeAllowance() {
+    if (this._allow) return this._allow;
+    const out = { w: { light: 0, dark: 0 }, b: { light: 0, dark: 0 } };
+    if (!this.empty.light || !this.empty.dark) return (this._allow = out);
+
+    const baseOf = (sh) => this.empty[sh];
+    // What a piece would show on `sh`, reconstructed from its own template.
+    // The templates are the composite, so this is the observation `learn` had.
+    const shows = (code, sh) => {
+      const p = this.piece[code];
+      if (!p) return null;
+      const base = baseOf(sh), o = new Float32Array(SQ_BYTES);
+      for (let i = 0; i < SQ_BYTES; i++) o[i] = p.ink[i] + (1 - p.opacity[i]) * base[i];
+      return o;
+    };
+
+    for (const code of Object.keys(this.piece)) {
+      if (this.oneShade[code]) continue;        // a guess is all this one ever had
+      for (const seen of ['light', 'dark']) {
+        const other = seen === 'light' ? 'dark' : 'light';
+        const obs = shows(code, seen), truth = shows(code, other);
+        if (!obs || !truth) continue;
+        // The same twin the real guess is given: the opposite-colour piece of
+        // the same kind, as seen on the shade being predicted.
+        const twin = shows((code[0] === 'w' ? 'b' : 'w') + code.slice(1), other);
+        const g = maskFromDeviation(obs, baseOf(seen), twin, baseOf(other), this.contrast);
+        let sum = 0;
+        for (let i = 0; i < SQ_BYTES; i++) {
+          // Ink from the single shade, exactly as the guessed branch derives it.
+          const ink = obs[i] - (1 - g[i]) * baseOf(seen)[i];
+          const d = truth[i] - (ink + (1 - g[i]) * baseOf(other)[i]);
+          sum += d * d;
+        }
+        const mse = sum / SQ_BYTES;
+        if (mse > out[code[0]][other]) out[code[0]][other] = mse;
+      }
+    }
+    return (this._allow = out);
+  }
+
+  /**
+   * The extra cost expecting `code` on square `idx` is allowed to carry.
+   *
+   * Zero for every piece whose opacity was solved, and zero for a guessed piece
+   * standing on the shade it was learned on — there the guess cancels against
+   * the background it was fitted to. See {@link shadeAllowance}.
+   */
+  slackFor(code, idx) {
+    const seen = this.oneShade[code];
+    if (!seen) return 0;
+    const [r, c] = toBoardCoords(idx, this.flipped);
+    const sh = shadeOf(r, c);
+    if (sh === seen) return 0;
+    return this.shadeAllowance()[code[0]][sh];
+  }
+
+  /**
+   * {@link slackFor}, but only where the pixels have earned it.
+   *
+   * The allowance excuses an imprecise *prediction* of a known piece; it must
+   * never excuse the wrong piece. On a board whose guess is poor the measured
+   * allowance can run to thousands, and granted unconditionally that would stop
+   * the square saying anything at all — the opposite of the mistake this fixes,
+   * and the one that puts the coach on a line the game never played.
+   *
+   * So it is granted only while the expected piece is still the cheapest
+   * explanation of its own square. That is the same question the decorated
+   * squares are asked — name the expected piece — reached from the other side:
+   * if something else explains these pixels better, there is nothing here for
+   * the estimate to have been imprecise about. Measured on the session this was
+   * written for, the white queen on e3 read `want=wq(877) best=wq(877)`: the
+   * right piece, merely too expensive, which is exactly the case to excuse.
+   */
+  allowanceAt(table, idx, want) {
+    const give = this.slackFor(CODES[want], idx);
+    if (!give) return 0;
+    const row = idx * CODES.length;
+    let best = Infinity;
+    for (let k = 0; k < CODES.length; k++) if (table[row + k] < best) best = table[row + k];
+    return table[row + want] <= best ? give : 0;
   }
 
   /**
@@ -516,6 +865,25 @@ export class BoardModel {
    * The gain is clamped because a tint cannot erase a piece. Without a floor
    * under it, a flat highlighted square fits *every* code at once by taking the
    * gain to zero and the offset to its mean, and the comparison says nothing.
+   *
+   * The ceiling is above one because the affine model is only true of the
+   * background. A highlight is drawn *under* an opaque piece, so it moves the
+   * square and leaves the sprite where it was — and when it moves the square
+   * *away* from the piece's own intensity, the tile comes out with more
+   * contrast than the template predicts, not less. A black knight on a dark f6
+   * lightened by a last-move highlight is exactly that case: the fit wanted a
+   * gain of 1.50, a ceiling of one held it to 1.00, and a square that fits at
+   * 245 was scored at 478 — over the soft bound, so the only line that
+   * explained the board was refused and an 800-second session never recovered.
+   * A ceiling of one could only ever be right for a tint drawn *over*
+   * everything, which is not how any of these boards draw one.
+   *
+   * Two is where the physics puts it: the most a background-only tint can
+   * amplify apparent contrast is the ratio it can open between piece and
+   * square, and a dark square lightened to mid-grey under a black piece is
+   * about twice the template's. It stays a bound rather than a free parameter,
+   * so the discrimination the residual is there to provide survives — a
+   * displaced piece is mismatched in *shape*, which no gain repairs.
    */
   bestUnderTint(frame, idx) {
     const tile = square(frame, idx);
@@ -537,7 +905,7 @@ export class BoardModel {
         vp += dp * dp;
         cov += dp * (tile[i] - mo);
       }
-      const gain = Math.min(1, Math.max(0.35, vp > 0 ? cov / vp : 1));
+      const gain = Math.min(2, Math.max(0.35, vp > 0 ? cov / vp : 1));
       const residual = vo - 2 * gain * cov + gain * gain * vp;
       if (residual < lowest) { next = lowest; lowest = residual; arg = k; }
       else if (residual < next) next = residual;
@@ -633,12 +1001,64 @@ export class BoardModel {
       // A decorated square never gets the pixel test; any other square gets it
       // first and only falls through to the weaker question if it fails.
       const decoratedHere = !!(soft && soft[idx] && tint);
-      if (!decoratedHere && table[idx * CODES.length + want] <= limit) continue;
-      if (this.excused(tint, idx, want, softLimit)) continue;
+      // Both bounds carry it, because it is the *prediction* that is imprecise,
+      // not the reading: a tinted reading of a guessed piece inherits the same
+      // error the plain one does.
+      const give = this.allowanceAt(table, idx, want);
+      if (!decoratedHere && table[idx * CODES.length + want] <= limit + give) continue;
+      if (this.excused(tint, idx, want, softLimit + give)) continue;
       n++;
       if (out) out[idx] = 1;
     }
     return n;
+  }
+
+  /**
+   * Legal moves out of `fen` that this calibration could never see.
+   *
+   * The one question that decides whether a board is worth playing on, and it
+   * is asked of the calibration rather than of the board: if a move can be made
+   * and leave *no* square wrong, then that move is indistinguishable from
+   * standing still and will never be detected, however long you wait.
+   *
+   * It exists because every numeric guard missed the case it was built for. A
+   * `squareLimit` of 2714 — inflated by a stale last-move highlight, which is
+   * one square dragging the worst-square term up with it — made sixteen of the
+   * twenty legal first moves invisible: 1.e4 changes e2 (cost 578) and e4
+   * (573), and both sit far under 2714, so neither is flagged and the coach
+   * simply never notices the game has begun. Three sessions died that way, none
+   * of them grading a single move. Meanwhile the ratio of `squareLimit` to what
+   * the board's contrast implies does *not* separate the good calibrations from
+   * the bad: it reads 5.28 and 5.45 on boards that graded 29- and 26-move games,
+   * against 1.52 on one that was hopeless for a different reason.
+   *
+   * So this is binary and there is nothing to tune. A board that can see all
+   * twenty first moves is not thereby perfect; a board that cannot see one of
+   * them is certainly broken.
+   *
+   * It also catches the other half of a decoration, which no limit can. Where a
+   * highlight sat on an *empty* square its background is learned with the tint
+   * in it, so the square fits itself perfectly and a move onto it changes
+   * nothing measurable — blind at every limit, including a corrected one. That
+   * is why the answer to this is to refuse the calibration rather than to clamp
+   * the number.
+   *
+   * @param {Uint8Array} frame  the same frame the templates were learned from
+   * @param {string} fen        the position that frame is known to show
+   * @param {number} squareLimit
+   * @returns {string[]} SAN of every move that leaves nothing wrong
+   */
+  blindMoves(frame, fen, squareLimit) {
+    const table = this.costTable(frame);
+    const chess = new Chess(fen);
+    const out = [];
+    for (const mv of chess.moves({ verbose: true })) {
+      chess.move(mv);
+      const n = this.misfits(table, gridOf(chess, this.flipped), squareLimit);
+      chess.undo();
+      if (n === 0) out.push(mv.san);
+    }
+    return out;
   }
 
   /**
@@ -677,8 +1097,10 @@ export class BoardModel {
       // Exactly the predicate misfits uses, so a square listed here is a square
       // that was counted there — no second opinion to reconcile.
       const softHere = decoratedHere && !!tint;
+      const give = this.allowanceAt(table, idx, want);
       const wrong = covered ? false
-        : (softHere || wantCost > limit) && !this.excused(tint, idx, want, softLimit);
+        : (softHere || wantCost > limit + give)
+          && !this.excused(tint, idx, want, softLimit + give);
       if (!wrong && !covered) continue;
 
       out.push({
@@ -1105,22 +1527,40 @@ export class BoardModel {
     const probe = new Chess(chess.fen());
     const seen = new Map();          // position key -> best line reaching it
 
+    /*
+     * Every depth from 1 to `plies`, not `plies` exactly.
+     *
+     * Walking to an exact depth means a rung cannot represent a truth shallower
+     * than itself. Measured on a real session: the board was one ply ahead —
+     * a queen had moved and nothing else — and the two-ply rung, unable to stop
+     * at one, had to invent a reply for the opponent. It returned `Qe3 a5`,
+     * three squares wrong, and was refused on the square count while its own
+     * confidence margin passed by 66%. The move it needed was the first half of
+     * its own line.
+     *
+     * The shallower positions are nearly free — thirty of them against nine
+     * hundred at two plies — and `seen` already dedupes by grid, so a line that
+     * transposes into a position another line reached is counted once. What it
+     * changes is that a rung can now answer "you moved and we missed it" without
+     * having to claim a number of plies it has no evidence for.
+     */
     const walk = (depth, line) => {
-      if (depth === 0) {
+      if (line.length) {
         const grid = gridOf(probe, this.flipped);
         const key = String.fromCharCode(...grid);
-        if (seen.has(key)) return;
-        // Each line is judged with the decoration *it* implies: whatever move
-        // really landed last is the one the board is highlighting now.
-        const soft = decorated(probe, line[line.length - 1], this.flipped);
-        seen.set(key, {
-          line: line.slice(),
-          score: this.scoreGrid(table, grid, mask),
-          misfits: squareLimit == null ? 0
-            : this.misfits(table, grid, squareLimit, { skip: mask, soft, tint, softLimit }),
-        });
-        return;
+        if (!seen.has(key)) {
+          // Each line is judged with the decoration *it* implies: whatever move
+          // really landed last is the one the board is highlighting now.
+          const soft = decorated(probe, line[line.length - 1], this.flipped);
+          seen.set(key, {
+            line: line.slice(),
+            score: this.scoreGrid(table, grid, mask),
+            misfits: squareLimit == null ? 0
+              : this.misfits(table, grid, squareLimit, { skip: mask, soft, tint, softLimit }),
+          });
+        }
       }
+      if (depth === 0) return;
       for (const m of probe.moves({ verbose: true })) {
         probe.move(m);
         line.push(m);
@@ -1181,14 +1621,23 @@ export class BoardModel {
    */
   replaceLast(table, chess, { mask = null, squareLimit = null, tint = null,
                               softLimit = Infinity } = {}) {
+    /*
+     * Each way of declining says which. All four used to return a bare `null`
+     * and the caller logged every one of them as `no move`, so the rung's
+     * refusal — the whole diagnostic value of a rung that validates before it
+     * keeps — could not be read afterwards. On a real session `no move` appeared
+     * with a 34-ply game in hand, where it actually meant "the move we recorded
+     * is the best explanation of the board", which is the rung *agreeing* with
+     * the tracked position and the opposite of what the string suggests.
+     */
     const probe = new Chess();
     try {
       probe.loadPgn(chess.pgn());
     } catch {
-      return null;                             // no history we can walk back
+      return { no: 'history' };                // nothing we can walk back
     }
     const was = probe.undo();
-    if (!was) return null;                     // no move to replace
+    if (!was) return { no: 'first move' };     // no move to replace yet
 
     const ranked = [];
     for (const m of probe.moves({ verbose: true })) {
@@ -1209,9 +1658,11 @@ export class BoardModel {
     ranked.sort((a, b) => a.score - b.score);
 
     const best = ranked[0], second = ranked[1];
-    if (!best) return null;
+    if (!best) return { no: 'no legal move' };
     const wasUci = was.from + was.to + (was.promotion ?? '');
-    if (best.uci === wasUci) return null;      // not a phantom: it is what we said
+    // Not a phantom: it is what we said. Worth distinguishing, because it is the
+    // rung confirming the tracked position rather than failing to run.
+    if (best.uci === wasUci) return { no: 'confirmed', was, score: best.score };
     return {
       ...best,
       was,

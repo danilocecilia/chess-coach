@@ -115,6 +115,9 @@ class SessionLog {
       w: {
         pending: watcher.pending, count: watcher.count,
         lost: watcher.lost, blind: watcher.blind,
+        // Only when there was something to refuse, so an idle board does not
+        // carry a null field on every frame of a long session.
+        ...(watcher.refused ? { refused: watcher.refused } : {}),
       },
       ...extra,
     }) + '\n');

@@ -13,6 +13,10 @@
  *   fits   the winning hypothesis must explain the pixels about as well as
  *          calibration did. A piece halfway between two squares fits nothing
  *          well, and neither does any move if we have already lost sync.
+ *          Asked as a mean only where squares were not counted — where they
+ *          were, the count answers the same question better, and a floor that
+ *          has gone stale cannot then veto a board the count has proved. See
+ *          the note in `feed`.
  *   beats  it must still beat "nothing changed" by the usual margin.
  *   alone  it must beat the *runner-up* hypothesis too. A board mid-repaint —
  *          chess.com fading in a blunder highlight, say — makes every candidate
@@ -51,6 +55,18 @@ export function frameDiff(a, b) {
   return d / a.length;
 }
 
+/**
+ * Pixel difference at or below which a frame counts as settled. A board that is
+ * not moving measures exactly 0; anything mid-animation does not.
+ */
+export const QUIET = 0.5;
+
+/**
+ * How many foreign-looking squares we will read around before concluding we
+ * cannot see the board at all.
+ */
+export const OCCLUDE_MAX = 6;
+
 export class MoveWatcher {
   /**
    * @param {object} o
@@ -73,8 +89,8 @@ export class MoveWatcher {
    *                                  read around before declaring we cannot see
    *                                  the board at all
    */
-  constructor({ floor = null, threshold = 6, quiet = 0.5, stable = 2, patience = 12,
-                slack = 2, allow = 0, confidence = null, occludeMax = 6 }) {
+  constructor({ floor = null, threshold = 6, quiet = QUIET, stable = 2, patience = 12,
+                slack = 2, allow = 0, confidence = null, occludeMax = OCCLUDE_MAX }) {
     Object.assign(this, { floor, threshold, quiet, stable, patience, slack, allow, occludeMax });
     this.confidence = confidence ?? threshold;
     this.prev = null;
@@ -84,11 +100,25 @@ export class MoveWatcher {
     this.lost = 0;
     /** Consecutive settled frames with too much foreign paint to read at all. */
     this.blind = 0;
+    /**
+     * Why the last frame's best candidate was not accepted: `threshold`,
+     * `squares`, `mean`, `confidence`, or null for "nothing was proposed" and
+     * for a frame that was accepted. Recorded, never acted on — the session log
+     * reads it so that a refused move leaves a reason behind.
+     */
+    this.refused = null;
+    /** Set by {@link relearnFloor}; cleared by the frame that supplies a new one. */
+    this.floorPending = false;
+    /** The floor most recently re-measured, so main.js can report it once. */
+    this.relearned = null;
     /** Last frame's pixel difference and whether that counted as settled. Kept
      *  only so the session log can record the number the decision used, rather
      *  than measuring it a second time and reporting something subtly else. */
     this.diff = Infinity;
     this.settled = false;
+    /** Accepted moves whose fit was above what calibration said this board costs.
+     *  A count of "board.json is stale", not a reason to refuse anything. */
+    this.overFloor = 0;
   }
 
   /**
@@ -109,6 +139,27 @@ export class MoveWatcher {
    */
   fits(error) {
     return this.floor == null || error <= this.floor * this.slack + this.allow;
+  }
+
+  /**
+   * Forget the fit floor: the board is no longer the one it was measured on.
+   *
+   * Called when the board turns round, which is the one change that keeps every
+   * template valid and makes this one number wrong — square shade is (rank +
+   * file) parity, which a rotation preserves, so the pieces still match while
+   * the per-square backgrounds no longer line up with the screen positions they
+   * were learned at.
+   *
+   * A null floor is not a gap: {@link fits} has no opinion without one, and the
+   * per-square count — which is measured against this board rather than against
+   * the calibration frame — is the better question anyway and is unaffected. So
+   * the interval between forgetting and re-measuring is judged by the test that
+   * was already doing the work.
+   */
+  relearnFloor() {
+    this.floor = null;
+    this.floorPending = true;
+    this.relearned = null;
   }
 
   /**
@@ -148,6 +199,32 @@ export class MoveWatcher {
         : this.fits(det.still) || this.fits(det.score);
       if (explained) this.lost = 0;
       else this.lost++;
+
+      /*
+       * A floor measured in the other orientation describes nothing.
+       *
+       * `floor` is what a correct reading of this board costs, and it is written
+       * once at calibration. Turn the board round — a new game that hands you
+       * the other colour, or the site's flip button — and the number survives
+       * while the thing it measured does not. Measured on a real session: the
+       * new-game rung correctly turned the board at frame 2, after which a
+       * *perfect* reading of the opening position cost 188.6 against a recorded
+       * floor of 43.4. The budget was 203.8 and correct readings ran to 302, so
+       * the mean test had negative headroom from the second frame on; 48 of 58
+       * moves had to come back through the recovery ladder and the game was
+       * eventually lost outright.
+       *
+       * So an orientation change invalidates it (see {@link relearnFloor}) and
+       * the next frame that reads cleanly supplies a new one. That frame is the
+       * best possible measurement of the quantity: the tracked position with no
+       * square wrong is exactly what calibration measured, on the board as it
+       * now is.
+       */
+      if (this.floorPending && counted && det.stillMisfits === 0) {
+        this.floor = det.still;
+        this.floorPending = false;
+        this.relearned = det.still;
+      }
     }
 
     /*
@@ -175,12 +252,66 @@ export class MoveWatcher {
     const counted = det.stillMisfits != null && det.bestMisfits != null;
     const explains = !counted || det.bestMisfits === 0;
 
-    if (!det.uci || det.still - det.score <= this.threshold || !this.fits(det.score)
+    /*
+     * The mean test is asked only when squares were not counted, which is the
+     * same structure the loss test above already uses and for the same reason:
+     * where a per-square count exists it is strictly the better question, and
+     * laying a mean on top of it can only refuse things the count has already
+     * proved.
+     *
+     * That is not hypothetical. Measured on a real session, `fits` was the
+     * sole reason 100 of the 107 settled frames whose winner explained all 64
+     * squares were thrown away — 93% — because the floor in board.json no
+     * longer described the board on screen. Calibration had recorded 43.4; the
+     * opening position itself, read correctly with zero misfits, cost 189. The
+     * budget lands at 203.8 while a *correct* reading of that board ranged
+     * 188-317, so the mean was not separating right from wrong, it was cutting
+     * the right answers roughly in half. Every move in that game had to come
+     * back through the two-ply ladder instead, at a second or two each, and the
+     * game was eventually lost outright.
+     *
+     * The count does not drift that way. It is measured against squareLimit,
+     * which is a property of this board rather than of the calibration frame,
+     * and a hypothesis that leaves no square wrong has already answered the
+     * question `fits` was asked to answer — a piece caught mid-slide fits
+     * nothing well *per square*, and shows up as misfits, not as a mean.
+     */
+    const fitsWell = counted ? explains : this.fits(det.score);
+
+    if (!det.uci || det.still - det.score <= this.threshold || !fitsWell
         || !explains || (det.margin ?? Infinity) < this.confidence) {
+      /*
+       * Why, and not only that it happened.
+       *
+       * Every rung of the ladder logs its refusals and the reason for them. This
+       * gate logged nothing, and it is the gate a move has to pass — so a move
+       * refused here left no trace at all beyond `accepted: null` on a frame
+       * whose winner explained every square, which no tool surfaced and no
+       * summary named. One session lost 330 seconds to exactly that, invisibly,
+       * and finding it afterwards meant reading the raw frame records by hand.
+       *
+       * Ordered as the conditions are evaluated, except that a square count
+       * outranks the mean: where squares were counted `fitsWell` *is* `explains`,
+       * so naming the mean there would misattribute the refusal to a budget that
+       * was never consulted.
+       */
+      this.refused = !det.uci ? null
+        : det.still - det.score <= this.threshold ? 'threshold'
+        : !explains ? 'squares'
+        : !fitsWell ? 'mean'
+        : 'confidence';
       this.pending = null;
       this.count = 0;
       return null;
     }
+    this.refused = null;
+
+    // A reading that explains every square while costing far more than
+    // calibration said it should is not a reason to refuse the move — but it
+    // does mean board.json describes a board that is no longer on screen, and
+    // that is worth saying once rather than leaving to be inferred from a game
+    // that grades strangely. main.js reads this; nothing here acts on it.
+    if (counted && this.floor != null && !this.fits(det.score)) this.overFloor++;
 
     this.count = det.uci === this.pending ? this.count + 1 : 1;
     this.pending = det.uci;
@@ -226,18 +357,46 @@ export class MoveWatcher {
  * So the ladder tracks what it has run rather than inferring it from a counter
  * that a slow rung can stall.
  */
+export const LADDER_RETRIES = 3;
+
 export class Ladder {
   constructor() {
-    this.fired = new Set();
+    this.fired = new Map();          // rung -> { shape, tries }
   }
 
   /**
-   * Is this rung due — reached, and not yet run this episode?
-   * Records the answer, so asking twice at the same depth answers once.
+   * Is this rung due — reached, and not yet run against *this* board?
+   * Records the answer, so asking twice about the same board answers once.
+   *
+   * Once per episode was too few, for the same reason thirteen times in a row
+   * was too many: what makes a repeat worth paying for is the board having
+   * changed under it. Measured on a real session, the two-ply rung ran while the
+   * truth was one ply ahead and refused; the board then ran on to exactly two
+   * plies ahead — squarely inside that rung's reach — and it never ran again,
+   * because it had already been ticked off. The three-ply search went instead,
+   * spent 15 seconds, and came back to a board four plies gone.
+   *
+   * So a rung re-arms when `shape` changes and not otherwise. A refused search
+   * repeated against an unchanged board is the same question twice and is
+   * refused again; repeated against a board that has moved on it is a different
+   * question with a real chance of a different answer. Capped all the same, so a
+   * board that churns cannot make a slow rung monopolise the poll.
+   *
+   * @param {number} lost     settled frames spent lost
+   * @param {number} at       the count this rung is due at
+   * @param {*} [shape]       a value standing for the current arrangement of
+   *                          wrong squares; `null` keeps the old once-only
+   *                          behaviour, which is what the cheap rungs want
    */
-  due(lost, at) {
-    if (lost < at || this.fired.has(at)) return false;
-    this.fired.add(at);
+  due(lost, at, shape = null) {
+    if (lost < at) return false;
+    const prev = this.fired.get(at);
+    if (!prev) {
+      this.fired.set(at, { shape, tries: 1 });
+      return true;
+    }
+    if (shape === null || shape === prev.shape || prev.tries >= LADDER_RETRIES) return false;
+    this.fired.set(at, { shape, tries: prev.tries + 1 });
     return true;
   }
 

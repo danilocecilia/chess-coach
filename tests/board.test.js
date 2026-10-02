@@ -12,7 +12,8 @@ import assert from 'node:assert/strict';
 import { Chess } from 'chess.js';
 import { BoardModel, fenToGrid, CODES, toBoardCoords, shadeOf, detectFlipped,
          indexOfSquare, squareName, decorated, gridOf, orientationOf,
-         ORIENTATION_MARGIN } from '../src/board.js';
+         ORIENTATION_MARGIN, inkTone, chooseOrientation,
+         oneShadeCodes, LEARNED_FROM } from '../src/board.js';
 import { SQ_BYTES } from '../src/capture.js';
 
 const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
@@ -45,15 +46,37 @@ function sprite(code) {
   return s;
 }
 
+/**
+ * The sprites above give every code its own random colour, which is right for
+ * testing separability and wrong for testing orientation: a real piece set
+ * draws White's men lighter than Black's, and that tonal difference is the only
+ * thing `inkTone` has to go on. This keeps each code's coverage mask — so the
+ * shapes stay as distinguishable as before — and replaces the colour with one
+ * that depends only on the side.
+ */
+function tonal(code, white, black) {
+  const s = sprite(code);
+  const colour = new Float32Array(SQ_BYTES);
+  // Not flat: a real piece has an outline and a highlight, and an ink average
+  // taken over a flat fill would pass a test a real one would fail.
+  for (let i = 0; i < SQ_BYTES; i++) {
+    const shade = code[0] === 'w' ? white : black;
+    colour[i] = Math.max(0, Math.min(255, shade + (s.colour[i] % 40) - 20));
+  }
+  return { colour, opacity: s.opacity };
+}
+
 /** Render a position into the same byte layout ps/capture.ps1 emits. */
-function render(fen, { flipped = false, noise = 0 } = {}) {
+function render(fen, { flipped = false, noise = 0, light = 200, dark = 96,
+                       white = null, black = null } = {}) {
   const grid = fenToGrid(fen, flipped);
   const frame = new Uint8Array(64 * SQ_BYTES);
   for (let idx = 0; idx < 64; idx++) {
     const [r, c] = toBoardCoords(idx, flipped);
-    const base = shadeOf(r, c) === 'light' ? 200 : 96;
+    const base = shadeOf(r, c) === 'light' ? light : dark;
     const code = CODES[grid[idx]];
-    const s = code === '.' ? null : sprite(code);
+    const s = code === '.' ? null
+      : white != null ? tonal(code, white, black) : sprite(code);
     for (let i = 0; i < SQ_BYTES; i++) {
       let v = s ? s.opacity[i] * s.colour[i] + (1 - s.opacity[i]) * base : base;
       if (noise) v += (Math.random() * 2 - 1) * noise;
@@ -108,6 +131,88 @@ test('a piece seen on one square colour is predicted on the other', () => {
   const fen = '4k3/8/8/8/8/8/3Q4/4K3 w - - 0 1';   // white queen on d2, the other colour
   const err = m.scoreFen(m.costTable(render(fen)), fen);
   assert.ok(err < 40, `queen on the unseen colour should still fit, got ${err.toFixed(1)}`);
+});
+
+test('only the pieces standing on one colour are recorded as guessed', () => {
+  const m = trained();
+  assert.deepEqual(m.oneShade,
+    { bq: 'dark', bk: 'light', wq: 'light', wk: 'dark' });
+  // Derived identically for a model written before the field existed, so an
+  // older board.json is protected without being re-learned.
+  assert.deepEqual(oneShadeCodes(LEARNED_FROM), m.oneShade);
+  assert.deepEqual(BoardModel.fromJSON(m.toJSON()).oneShade, m.oneShade);
+});
+
+test('the shade allowance is measured, and only where the guess was used', () => {
+  /*
+   * The allowance exists because the king and queen's opacity is estimated
+   * rather than solved, and an estimate that is off costs the whole board
+   * contrast once the piece steps onto the other shade. What it must not do is
+   * loosen anything else: a solved piece gets nothing anywhere, and a guessed
+   * piece gets nothing on the shade it was actually seen on, where the estimate
+   * cancels against the background it was fitted to.
+   */
+  const m = trained();
+  const dark = indexOfSquare('e3', false), light = indexOfSquare('d1', false);
+  assert.equal(shadeOf(...toBoardCoords(light, false)), 'light');
+
+  assert.ok(m.slackFor('wq', dark) > 0, 'the queen is guessed, and e3 is not her shade');
+  assert.equal(m.slackFor('wq', light), 0, 'on her own shade the guess cancels');
+  for (const code of ['wp', 'wr', 'wn', 'wb', 'bp', 'br', 'bn', 'bb']) {
+    assert.equal(m.slackFor(code, dark), 0, `${code} was solved, not guessed`);
+    assert.equal(m.slackFor(code, light), 0, `${code} was solved, not guessed`);
+  }
+  assert.equal(m.slackFor('.', dark), 0, 'an empty square predicts nothing');
+});
+
+test('the allowance excuses an expensive queen but never a wrong piece', () => {
+  /*
+   * The distinction the whole allowance rests on. A white queen on a dark square
+   * is the case it exists for — the right piece, too expensive, measured at 646
+   * against a limit of 200 on the session that lost 159 seconds to it. A *rook*
+   * on that square is not: the pixels are better explained by something other
+   * than what the position claims, so there is nothing for an imprecise estimate
+   * to excuse and the square must still count as wrong.
+   */
+  const m = trained();
+  const idx = indexOfSquare('e3', false);
+  const queen = '4k3/8/8/8/8/4Q3/8/4K3 w - - 0 1';   // white queen on dark e3
+  const rook = '4k3/8/8/8/8/4R3/8/4K3 w - - 0 1';    // a rook there instead
+
+  // A limit far under what a guessed piece on its unseen shade costs, so the
+  // plain pixel test cannot pass and only the allowance can rescue it.
+  const tight = 1;
+  const qTable = m.costTable(render(queen));
+  assert.equal(m.misfits(qTable, fenToGrid(queen, false), tight), 0,
+    'the queen is the best explanation of her own square, so the estimate is excused');
+
+  // The same frame, judged as though a rook stood there: the queen's pixels
+  // explain it better, the allowance is not earned, and the square is wrong.
+  const asRook = fenToGrid(rook, false);
+  assert.ok(m.allowanceAt(qTable, idx, asRook[idx]) === 0,
+    'a rook is not the best explanation of a square holding a queen');
+  assert.ok(m.misfits(qTable, asRook, tight) > 0, 'a wrong piece is still wrong');
+});
+
+test('a sane limit sees every opening move; an inflated one goes blind', () => {
+  /*
+   * The check calibration is now refused on. A `squareLimit` of 2714 — inflated
+   * by one decorated square dragging the worst-square term up with it — made
+   * sixteen of the twenty first moves indistinguishable from standing still, and
+   * three sessions died without grading a move. The ratio of the limit to what
+   * the board's contrast implies does not separate good calibrations from bad;
+   * this does, and it has nothing to tune.
+   */
+  const m = trained();
+  const frame = render(START);
+  assert.deepEqual(m.blindMoves(frame, START, 200), [],
+    'at a sane limit every legal first move changes something measurable');
+
+  // Nothing about the board changed — only the number a wrong square is judged
+  // against, which is exactly how the real failure arose.
+  const blind = m.blindMoves(frame, START, 100_000);
+  assert.equal(blind.length, 20, `an absurd limit should hide all 20 moves, hid ${blind.length}`);
+  assert.ok(blind.includes('e4') && blind.includes('Nf3'), 'including the commonest ones');
 });
 
 test('recognises the start position as unchanged', () => {
@@ -517,10 +622,15 @@ test('a move we recorded correctly is not replaced', () => {
   const frame = new Uint8Array(render(game.fen()));
   const found = m.replaceLast(m.costTable(frame), game,
     { squareLimit: HELD_LIMIT, tint: m.tintReader(frame), softLimit: HELD_SOFT });
-  assert.equal(found, null, 'nothing to replace when the board agrees with us');
+  // Declining says which way it declined. "The move we recorded is still the
+  // best explanation of the board" is the rung agreeing with the tracked
+  // position, and used to be indistinguishable in the log from never having run.
+  assert.equal(found.no, 'confirmed', 'the board agrees with us, and says so');
+  assert.equal(found.was.san, 'Nc6');
 
   // Nor is there anything to replace before a move has been made.
-  assert.equal(m.replaceLast(m.costTable(render(START)), new Chess(START), {}), null);
+  assert.equal(m.replaceLast(m.costTable(render(START)), new Chess(START), {}).no,
+    'first move');
 });
 
 test('re-syncs a board that ran two plies ahead', () => {
@@ -1133,4 +1243,116 @@ test('an undo is refused when the board merely moved on', () => {
   game.undo();
   assert.ok(m.misfits(table, gridOf(game, false), FAKE_LIMIT) > 0,
     'a board that moved on must not be explained by going back');
+});
+
+/*
+ * Orientation.
+ *
+ * These cover the bug that made a Black player be coached as White for a whole
+ * game: calibration picked which way round the board was by learning a model
+ * each way and keeping whichever fitted better, which is a question with no
+ * answer. The first test below is the regression guard — it pins the tie that
+ * made the old test meaningless — and the rest cover what replaced it.
+ */
+
+const tonalBoard = (flipped) => render(START, { flipped, white: 215, black: 45 });
+const tonalModel = (flipped, frame = tonalBoard(flipped)) =>
+  new BoardModel({ flipped }).learn(frame, START);
+
+test('fit cannot tell a board from the same board upside down', () => {
+  const frame = tonalBoard(true);
+  const fit = (f) => new BoardModel({ flipped: f }).learn(frame, START)
+    .detectMove(frame, new Chess(START)).still;
+
+  // Not "close": identical. `learn` fits its templates to whatever sits under
+  // the grid it is given, so each model reproduces its own training frame
+  // exactly and the comparison carries no information at all. Calibration used
+  // to break this tie with a stable sort, which meant it always answered
+  // "white at bottom" whatever was on the screen.
+  assert.equal(fit(false), fit(true),
+    'both orientations must fit identically — this is why the fit test was dropped');
+});
+
+test('ink names the lighter men as White', () => {
+  const right = inkTone(tonalModel(true));
+  assert.equal(right.consistent, true, 'templates learned the right way round are consistent');
+  assert.ok(right.white > right.black, 'White is the lighter side');
+  assert.ok(right.separation > 100, `the two sides are far apart (got ${right.separation})`);
+});
+
+test('ink catches templates learned the wrong way round', () => {
+  // The same pixels, learned under the opposite assumption: every template now
+  // carries the other side's colour, which is the failure no fit can see.
+  const wrong = inkTone(tonalModel(false, tonalBoard(true)));
+  assert.equal(wrong.consistent, false, 'a swapped model must report itself inverted');
+  assert.equal(Math.round(wrong.separation), Math.round(inkTone(tonalModel(true)).separation),
+    'the two candidates are mirrors, so only the sign differs');
+});
+
+test('orientation is chosen correctly from either side of the board', () => {
+  for (const truth of [false, true]) {
+    const frame = tonalBoard(truth);
+    // Built the same way calibration builds it: one trial model, always the
+    // same way round, with the answer read off it rather than assumed.
+    const choice = chooseOrientation(new BoardModel({ flipped: false }).learn(frame, START), frame);
+    assert.equal(choice.flipped, truth, `board rendered flipped=${truth} must be read as such`);
+    assert.ok(choice.agree, 'ink and brightness must agree on a clean board');
+    assert.ok(choice.decisive, 'and the margin must be decisive');
+  }
+});
+
+/** A trial model with nothing in it but the two inks the decision reads. */
+const fakeTrial = (white, black, { flipped = false, contrast = 100 } = {}) => ({
+  flipped,
+  contrast,
+  piece: {
+    wp: { ink: new Float32Array(SQ_BYTES).fill(white), opacity: new Float32Array(SQ_BYTES).fill(1) },
+    bp: { ink: new Float32Array(SQ_BYTES).fill(black), opacity: new Float32Array(SQ_BYTES).fill(1) },
+  },
+});
+
+/** A frame that is plain bands, so `detectFlipped` reads a known answer. */
+const bands = (top, bottom) => {
+  const frame = new Uint8Array(64 * SQ_BYTES);
+  for (let idx = 0; idx < 64; idx++) {
+    frame.fill(idx < 16 ? top : idx >= 48 ? bottom : 128,
+      idx * SQ_BYTES, (idx + 1) * SQ_BYTES);
+  }
+  return frame;
+};
+
+test('orientation refuses to answer when the two sides are drawn alike', () => {
+  // Five grey levels apart against a bar of 25. A set with no tonal difference
+  // between the sides is one this test cannot rule on, and guessing there is
+  // how you invert a whole game silently.
+  const choice = chooseOrientation(fakeTrial(130, 125), bands(220, 60));
+  assert.equal(choice.flipped, null, 'an indecisive board gets no answer');
+  assert.equal(choice.decisive, false);
+  assert.equal(choice.byInk, false, 'it still has an opinion, it is just not trusted');
+});
+
+test('orientation refuses to answer when its two tests disagree', () => {
+  // Ink says White is the lighter side and the model was built white-at-bottom,
+  // so it reads flipped=false; brightness sees the far bank brighter and reads
+  // flipped=true. Both are decisive and they cannot both be right.
+  const choice = chooseOrientation(fakeTrial(210, 50), bands(240, 60));
+  assert.equal(choice.byInk, false);
+  assert.equal(choice.brightness.flipped, true);
+  assert.equal(choice.agree, false);
+  assert.equal(choice.flipped, null, 'disagreement must stop calibration, not pick a side');
+});
+
+test('a board theme change is visible in one frame', () => {
+  const model = tonalModel(false);
+  const same = model.themeDrift(tonalBoard(false));
+  assert.ok(!same.stale, `the board it was calibrated on is not stale (drift ${same.drift})`);
+  assert.ok(same.drift < 1, 'and barely drifts at all');
+
+  // The real case: a skin whose empty squares sit a dozen grey levels off the
+  // learned ones. Nothing fits, and without this the coach spends 24 seconds
+  // proving it the hard way.
+  const other = model.themeDrift(render(START, { flipped: false, light: 218, dark: 118,
+                                                 white: 215, black: 45 }));
+  assert.ok(other.stale, `a different skin reads as stale (drift ${other.drift})`);
+  assert.ok(other.light > 0 && other.dark > 0, 'and says which way the levels moved');
 });

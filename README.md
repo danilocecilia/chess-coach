@@ -3,6 +3,15 @@
 Watches a chess board on your screen and grades every move you play — Best,
 Inaccuracy, Mistake, Blunder — with a one-line explanation of what went wrong.
 
+Then it tells you what you *keep* getting wrong: a live dashboard that ranks
+your recurring habits across every game, because one blunder is an accident and
+three of the same blunder is the thing to train. See
+[Reviewing a game](#reviewing-a-game).
+
+Then it makes you play them again. `npm run play` deals back the positions you
+actually lost — your side, your move — and will not move on until you have found
+what was there. See [Playing it again](#playing-it-again).
+
 ## How it works
 
 Three parts, each doing what it is actually good at:
@@ -202,13 +211,41 @@ slop is trimmed off rather than shifting every square. Trimming is the only
 direction that works: the measurement can shrink your rectangle onto the grid
 but never grow it, so a drag that lands *inside* the board is not recoverable
 and every square ends up sampled off-centre. It learns this board's piece
-sprites from a position it already knows, and works out which way round the
-board is from piece brightness.
+sprites from a position it already knows.
+
+Which way round the board is gets **two** independent readings, and it stops if
+they disagree:
+
+```
+orientation:
+  ink       white 171.4 vs black 69.0  (apart by 102.4, needs 24.2)  -> black at bottom
+  brightness far 186.6 vs near 152.7  -> black at bottom
+  black at bottom (flipped) — you are Black
+```
+
+`ink` is how the two sides are drawn, with the square behind them divided out —
+a piece set draws White lighter than Black. `brightness` is which end of the
+board is lighter overall. They fail in different places, so agreement is worth
+something. Getting this wrong is not cosmetic: the colour names are baked into
+the templates, every later check is then made of the same mistake and agrees
+with it, and the whole game is graded for your opponent. So when the two
+disagree, or the sides are drawn too alike to call, calibration refuses to write
+anything and asks you to settle it:
+
+```
+npm run calibrate -- --flipped true      you are Black, black at bottom
+npm run calibrate -- --flipped false     you are White, white at bottom
+```
+
+This is only about which way the *board* is drawn. Which colour you are playing
+is re-read from the board at startup and at every new game, so calibrating as
+White and then being handed Black corrects itself and says so.
 
 Each run leaves `captures/calibration.png` — exactly what was captured, which
 is the fastest way to see whether the region was right.
 
-Re-run it if you change board theme or piece set.
+Re-run it if you change board theme or piece set. You do **not** need to re-run
+it just to play the other colour.
 
 ### Finding the board itself
 
@@ -259,7 +296,13 @@ npm start                  grade your moves
 node src/main.js --all     grade both sides
 node src/main.js --fen "…" start from a position other than the opening (a FEN —
                            see Notation below for how to write one)
+npm run review             what you keep getting wrong, across every game
+npm run dashboard          that, as a page, without playing
+npm run play               play the positions you lost, until you stop losing them
 ```
+
+A live review dashboard opens by itself when the coach starts, and follows the
+game as you play — see [Reviewing a game](#reviewing-a-game).
 
 A small always-on-top window shows the verdict; drag it anywhere. Ctrl+C stops.
 
@@ -311,6 +354,313 @@ topics cost nothing — `c` reuses the search the grader was going to run anyway
 A move you asked about is logged as `[you*]`, so a session stays a truthful
 record of what you found unaided.
 
+## Reviewing a game
+
+A grade tells you that a move was bad. It does not tell you what you *keep*
+doing, and that is the thing worth training: one blunder is an accident, three
+blunders that are all "left a piece nobody was defending" is a habit.
+
+So when a game ends — Ctrl+C, or a new game starting under the coach — it is
+reviewed, and the reviews are collected into one page:
+
+```
+how that went:
+  26 of your moves graded, accuracy 73.4%  (6 Best, 5 Excellent, 8 Good, 3 Mistake, 4 Blunder)
+  most costly habit: losing exchanges — 2 moves, 119% of win probability
+    e.g. your pawn on f5 is not defended well enough — Bxf5 costs you a pawn
+  the full review, and every other game: …\reports\index.html
+```
+
+`reports/index.html` is one self-contained file — no build step, no network —
+ranking your habits across every game you have played, with the games
+underneath as the evidence. The data is inlined rather than loaded from `logs/`
+because a `file://` page cannot read its siblings, so the file works on its own,
+opened from anywhere, with nothing running.
+
+### What is on the page
+
+**Find the move.** Reading "your knight on d4 had nothing defending it" teaches
+much less than being shown that position with the answer hidden and having to
+find it. So the page opens with your own mistakes as cards: the board as you saw
+it, whose move it is, and nothing else — no grade, no cost, no name for the
+fault, because each of those answers the question before you have looked. Reveal
+shows the move you played and the move that was there, marked on the board in
+the two colours the grades already use, with the line that punished you and the
+line that was better. `‹ ›` or the arrow keys move through the deck; space
+reveals.
+
+The deck is taken across faults rather than straight down the worst list —
+sorted purely by cost, the first ten cards are the same mistake ten times.
+
+**Click the board and it plays.** A bad move is rarely bad on its own — it is
+bad for the answer it allows, and "he answers Rxd4 Ke7" is a line you were left
+to play out in your head against a position sitting right in front of you. So
+the board opens: your move and how you were punished, then the move that was
+there and how it went on, one ply at a time, on the same position. `‹ ›` or the
+arrow keys step through it, any move in the line jumps to it, space replays, Esc
+closes. The diagram beside each habit opens the same way — and the trainer's
+only after you have revealed the card, since a replay of the answer is the
+answer.
+
+The lines come out of the searches the coach already ran, so they cost nothing
+to keep. A review written before they were kept opens on the two moves alone and
+says so; `node tools/review.mjs --all` re-reads the logs and brings the rest
+back, without Stockfish and without re-grading anything.
+
+**Every habit reads as a lesson**, not a heading: what the fault is, why a human
+makes it, the checklist to run at the board while you still have the move, and
+one thing to drill. Hand-written, fixed, and not generated — it is the part of
+the page you are meant to remember, so it has to read the same way twice.
+
+**Am I fixing it?** Each habit carries its own history, as cost per 10 of your
+moves, game by game. Games where a fault did *not* happen count as zeros —
+counting only the games it appears in makes the one outcome you are working for
+invisible, since a habit you have fixed simply stops appearing. A verdict needs
+four games in view and at least two occurrences, and a ±15% move reads as flat;
+below that bar the page says "no trend yet" and why, rather than reading a
+direction out of noise.
+
+**Where each game turned** — your chance of winning after each of your own
+moves, with the two or three that actually changed it marked by name. **Where it
+goes wrong** splits by phase and by colour, in accuracy as well as in win
+probability lost, since accuracy is bounded and can therefore be compared
+between them. **Lost to blunders** says whether you are losing games to a
+handful of catastrophes or leaking evenly — two problems that need opposite
+advice.
+
+A review written before the page kept positions has no cards. The page names the
+fix where the deck would be:
+
+```
+node tools/review.mjs --deep --all
+```
+
+### The dashboard
+
+That file still has to be opened, and it only changes when a game ends — which
+is the wrong moment. The review is worth seeing two moves *after* you dropped a
+piece, and nobody is going to go and run a command then.
+
+So the coach serves it while it runs, and pushes a refresh after every graded
+move:
+
+```
+board:  live review at http://127.0.0.1:7171/ — it updates as you play
+```
+
+It opens once, by itself, the first time. The game you are playing appears at
+the top of the table marked **on the board now**, filling in as you go, and your
+scroll position and whichever habit you had open survive each refresh.
+
+```
+npm run dashboard                    without playing, to look back over old games
+npm run dashboard -- --port 8080     if something already has 7171
+npm run dashboard -- --no-open       don't take a browser tab
+```
+
+Run on its own it watches `logs/`, so a coach playing in another terminal — or a
+`--deep` review finishing — updates the tab you already have open.
+
+It is the same generated file, served with six lines of script appended: one
+page, one data path, and no way for the served view and the file to disagree.
+It binds to **127.0.0.1**, so it is reachable from this machine and nowhere
+else. A port already in use is the ordinary case of a second coach, and it
+quietly does without rather than failing to start a game.
+
+| | |
+|---|---|
+| `COACH_DASHBOARD=0` | don't serve it at all |
+| `COACH_OPEN=1` | also open a browser at it when the coach starts |
+| `COACH_PORT` | default `7171` |
+
+```
+npm run review                          the newest session
+node tools/review.mjs --all --open      every session, then open the page
+node tools/review.mjs --deep logs/<id>  re-grade that one with Stockfish
+node tools/review.mjs --pgn game.pgn    any PGN, from anywhere
+```
+
+### The two sources
+
+Both produce the same thing; only the evidence differs.
+
+| | |
+|---|---|
+| **instant** (default) | the grades the coach already computed while you played. Free, and exactly what you were told at the time — but your side only, and only the moves it actually saw. |
+| **`--deep`** | Stockfish walks the finished PGN: every move, both sides, one uniform depth, including the moves a desync swallowed. About a second a ply. |
+
+Deep is not twice the work it looks. The position after your move is the one
+your opponent moves from, so each `after` search is the next move's `before`
+search, handed straight back through the parameter `gradeMove` already has for
+it — one search a ply rather than two.
+
+A deep review is never silently replaced by a live one: an `--all` pass over a
+session that already has one keeps it and says so. `--force` if you mean it.
+
+### What it can name
+
+Every fault is a measurement against a position we stored and a line the engine
+returned — is the captured piece defended, was it already standing there, does
+this knight hit two things at once. Nothing here asks a model what it thinks
+went wrong, for the same reason `audit.js` does not: the honest answer is
+already computable.
+
+| | |
+|---|---|
+| **Walking into mate** | checked first, and before any material test — a mating attack is usually *paid for* in material, and counting the sacrifice would file a forced mate as "you won a piece" |
+| **Hanging pieces** | his move takes something of yours that nothing was defending |
+| **Ignoring his threat** | ...and it was already standing there, already attackable, before you moved. The same capture, a different mistake: one you walked into, one you were shown and did not answer |
+| **Forks** | the move that punishes you hits two pieces at once, or checks while hitting a second |
+| **Losing exchanges** | the trade comes out badly — worded differently depending on whether *you* started it |
+| **Missing what was there** | nothing was lost; the cost is what you passed up |
+| **King safety** | the king was already a problem and this move did not address it |
+| **Positional drift** | no material changes hands at all |
+
+Ranked by the win probability each one actually cost, which is the grader's own
+currency — so the review can never disagree with the grade you were shown while
+playing.
+
+**Accuracy** is Lichess's published curve, deliberately borrowed rather than
+invented: the number is only useful if it means what it means on the site you
+played the game on.
+
+### What it will not name
+
+There is no fault for a *quiet* threat you ignored. Proving one means asking
+what the position is worth before and after a free move — a search, which is
+what `t` pays for during the game and what a review of a finished game has no
+business paying for per move. Tested on real positions, the cheap version of
+that test ("he could already have played it") fires on almost every quiet move
+there is, and would file half a game under threats you ignored. So a quiet
+punishing move is left to the branches that can name what actually happened.
+
+**Positional drift is the honest residue**, not a diagnosis. It means no
+material moved and nothing above matched — usually a real positional concession,
+sometimes a tactic too long to see in the first exchange. It is the bucket to
+look at with an engine rather than the one to train against.
+
+Old sessions still review: their logs predate the grade record carrying enough
+to classify from, so the page shows their accuracy and grades and says outright
+that the detail needs `--deep` — which their `game.pgn` makes available
+retroactively.
+
+## Playing it again
+
+A review tells you what you keep getting wrong. It cannot make you *do* it
+differently, and that is the part that transfers: a pattern you have read about
+is recalled, a pattern you have played is recognised.
+
+```
+npm run play                  a session from your worst habits
+npm run play -- --dry-run     the deck and the picks, without starting anything
+```
+
+It hands back positions out of your own games — the same position, the same side,
+your move — and does not move on until you have found what was there. Then you
+play it out against the engine, because the move is only half of it: the reason
+`Qxe4+` was right is the three moves after it.
+
+```
+116 positions worth replaying, from 53 reviewed games.
+    43  Ignoring his threat
+    29  Missing what was there
+    12  Forks and double attacks
+    ...
+this session — 8 positions:
+   1. Missing what was there      95% lost   Black, move 24  new
+   2. Ignoring his threat         94% lost   Black, move 18  new
+```
+
+Click a piece and then its square. `t` / `w` / `c` ask the same three questions
+as the live coach, and are answered by the same code. `b` takes your last move
+back — see [Taking it back](#taking-it-back).
+
+### What a position has to be
+
+Taken from `logs/*/review.json`, so it needs games that have been reviewed and
+nothing else — no re-grading, and no Stockfish at all until a session starts.
+A position qualifies when it cost at least 8% of your winning chances, is past
+move 4, and the fault behind it is one with a move that is recognisably right.
+
+**Positional drift is not drillable**, on this project's own grounds: it is the
+residue, and "no material changes hands" has no move to find. Marking you wrong
+for picking a different quiet developing move would teach nothing. The same goes
+for a move that ended the game — mate is not a mistake, whatever the grade says.
+
+Which positions you get is weighted by what each habit has actually cost you,
+not by how often it happens, so most of a session is the two faults that are
+over half your total loss. Within a habit: what you failed last time first, then
+what you have not seen, then the most expensive. What you passed in the last two
+days is held back — but never excluded, so a deck you have been through still
+deals a session.
+
+`--kind missed-threat` spends the whole session on one habit. `--size 12` for a
+longer one.
+
+### What the coach does at every move
+
+| | |
+|---|---|
+| before you move | how much the position cost you, and on a *first* encounter the class of mistake — "something of yours is already attacked here" |
+| you find it | the grade, and the pattern to take away |
+| you miss it | the grade, the fault named from the board, and **his answer played out on the board** rather than written as a line you have to imagine |
+| after that | his reply, and a verdict on every move of the continuation |
+| you miss again | more than last time — see [the ladder](#where-this-bends-the-rule) |
+
+Judged by the grader itself: a move passes when `classify` would have called it
+Good or better. There is deliberately no second standard, so a drill can never
+disagree with the grade the live coach would have shown you for the same move.
+
+### Taking it back
+
+The rep is one move, but the three moves after it are half the lesson — and a
+continuation played into a lost position teaches nothing, least of all the two
+moves still left in it. So `b` takes your last move back, along with his answer to
+it, and hands you the same position to try something else on.
+
+It is available any time it is your move: after a blunder, and after a move that
+was merely timid. The one move it will not take back is the rep itself, because
+un-solving the drill is not retrying the line — a missed rep has `r`, and that is
+scored as a miss.
+
+A take-back is help, so it costs you the "found first time" count exactly as
+asking `t`/`w`/`c` does. And unwinding the same ply over and over climbs the same
+ladder as missing the rep does:
+
+### Where this bends the rule
+
+The coach will not name your move while you are playing. A drill is the one place
+that gives way, because a position you cannot solve would otherwise be a dead end
+and the answer is already on the review page. So, per position you keep getting
+wrong:
+
+| miss | what you get |
+|---|---|
+| 1 | his punishment on the board, the fault named, and what to look at |
+| 2 | and the loose piece named outright — the `w` topic's first line |
+| 3 | a real tip: whatever `w` has to say next about your position |
+| 4 | what he is threatening, as `t` would have told you |
+| 5 | how much the choice matters, as `c` would have told you |
+| 6 | the move |
+
+The tips are not written for this. They are the `t`/`w`/`c` answers, produced by
+the same code the buttons use, so the coach says the same thing whether you asked
+or it volunteered — and every one of them is recorded against your "found first
+time" count, because help is help however it arrived.
+
+**Only the rep ever reaches the last rung.** Past it there is no stored best move
+and nothing to reveal, so a continuation you keep unwinding runs to the tips and
+stops there. Never before you have moved, and never in the question itself.
+
+`logs/play-history.json` remembers what you have seen, so the next session brings
+back what you failed. Ctrl+C banks whatever you finished — an abandoned session
+still taught you the positions you got through.
+
+| | |
+|---|---|
+| `COACH_PLAY_PORT` | default `7272`, so it never fights the dashboard's `7171` |
+| `COACH_PLAY_OPP_DEPTH` | default `12`. How hard the opponent plays — grading stays at `COACH_DEPTH`, because that is what your grades have always meant |
+
 ## Diagnosing a desync
 
 Every run records itself into `logs/<timestamp>/`, and the point of keeping it
@@ -323,6 +673,9 @@ logs/<run>/session.jsonl   every frame's numbers, every move, every recovery
 logs/<run>/frames.bin.gz   every frame's pixels, so the decision can be taken
                            again offline
 logs/<run>/game.pgn        the game as the coach believed it went
+logs/<run>/review.json     the games of that session, reviewed — see Reviewing
+                           a game. Outlives frames.bin.gz, which is the big file
+                           and the first one anybody deletes
 ```
 
 A frame is 16KB at ~6.7/s, which raw would be 400MB an hour; gzipped over a
@@ -338,6 +691,7 @@ After a session that went wrong:
 ```
 node tools/log-summary.mjs            the newest run, on one screen
 node tools/replay.mjs --board 912     what the screen actually showed at frame 912
+node tools/frame-png.mjs              that frame as an actual picture
 ```
 
 The summary prints the timeline — moves, every episode of lost sync with the
@@ -367,6 +721,22 @@ against the screen, both ways round, on every frame. It also acts on it: a
 board that matches the opening position exactly, with nothing covering it, is
 the next game, and the coach starts over rather than staying lost.
 
+`frame-png.mjs` writes a recorded frame back out as a PNG — the 64 grayscale
+tiles laid out as they sat on screen, with the capture's own square boundaries
+drawn on. It answers the question the tables above cannot: *what was actually
+there?* A theme change, a board the other way round and a region that has
+slipped all read as "dozens of squares wrong" in the numbers and are each
+obvious in the picture at a glance.
+
+```
+node tools/frame-png.mjs                      newest session, first settled frame
+node tools/frame-png.mjs logs/<id> 912        a particular frame
+node tools/frame-png.mjs logs/<id> 1 out.png 6    somewhere else, 6x
+```
+
+Without an argument it writes `frame-<seq>.png` into the session's own log
+directory.
+
 ### What a desync looks like in the log
 
 | in the log | what happened |
@@ -379,6 +749,9 @@ the next game, and the coach starts over rather than staying lost.
 | `resync 2ply OK` | a move was missed and recovered; normal |
 | `flip OK` | you are playing the other colour now |
 | many squares wrong, no probe hit | a misread move, or the theme changed |
+| `! board levels are +11 light / +14 dark` in the header | the theme changed — re-calibrate; nothing will grade until you do |
+| `orientation` block naming a correction | you were handed the other colour; the board was read, not assumed |
+| `calibrated by ... — DISAGREED` | the templates were written over an orientation the evidence did not settle |
 | the *same* square wrong on every frame, from the first | it was decorated at calibration — run `check-calibration` |
 | `e4:bq tinted(1441)` — the expected piece, too expensive | the board is painting that square for a reason we cannot predict |
 | a rung repeating every ~14s | it outran the poll; see `Ladder` in `src/watch.js` |
@@ -429,6 +802,23 @@ What the move log shows, and what you read in any chess book.
 Squares are file (a–h, left to right from White's side) then rank (1–8, White's
 end to Black's).
 
+**On the report page you do not have to remember any of this**: every move is
+underlined, and hovering one reads it out — `Nxf8` as "knight takes on f8",
+`exd8=Q+` as "the pawn on the e-file takes on d8, promoting to a queen, with
+check". It covers the moves inside the engine's lines too, which is where the
+notation is least familiar and most worth reading.
+
+It is read from the notation itself rather than looked up in the position, so it
+says *knight takes on f8* and not *which* knight or what it took. That is
+deliberate: the moves in a variation have no position stored, and a reading that
+worked only on the move you played would explain the notation in exactly the
+cases where it is already obvious. It is also the structure that is being
+learned — capital letter is the piece, `x` is a capture, the square comes last.
+
+For the same reason it is attached only to moves, never to the sentences beside
+them: "your pawn on **f5** is not defended well enough" contains a square, and
+reading it back as "pawn to f5" would teach the notation wrongly.
+
 ### FEN — Forsyth–Edwards Notation
 
 One whole position on one line: what `--fen` takes, and what the coach prints if
@@ -457,6 +847,7 @@ e3 is flagged as capturable in passing.
 | | | |
 |---|---|---|
 | **ply** | one half-move | one move by one side. "Two plies ahead" is you moved and he replied. |
+| **accuracy** | | a whole game in one number, 0-100. Each move is scored off the win probability it cost and the scores averaged — Lichess's published curve, so it means what it means there. A move that costs nothing is 100; costing 10% is already down at 66. |
 | **PV** | principal variation | the line the engine thinks both sides should play |
 | **MultiPV** | | asking for the best *n* lines instead of just one |
 | **UCI** | Universal Chess Interface | the text protocol Stockfish speaks. Its moves are just from-square + to-square — `g1f3` for `Nf3`, `e7e8q` for `e8=Q`. |
@@ -475,6 +866,9 @@ Environment variables, or a `.env` file in this directory:
 | `COACH_SOFT_SLACK` | `2` | Multiple of the square limit a decorated square's *tint-fitted* error may reach before it counts as wrong rather than merely highlighted. This is what stops a piece held under the cursor being read as a piece that landed. Raise it if real moves are consistently accepted a frame or two late; lower it if phantom moves get through. On a real game the worst landed square measured 0.59x and a held bishop 3.66x. |
 | `COACH_THREAT_DEPTH` | `12` | Depth for the `t` search. Finding *what* he threatens needs less depth than pricing your move does. |
 | `COACH_LOG` | on | Set to `0` to stop recording sessions to `logs/`. See [Diagnosing a desync](#diagnosing-a-desync). |
+| `COACH_DASHBOARD` | on | Set to `0` and the coach serves no dashboard. Reviews are still written to `reports/index.html`, which needs nothing running. |
+| `COACH_OPEN` | off | Set to `1` and the coach opens a browser at the dashboard on startup. Off by default: the window lands over the board it is trying to watch, and takes the focus with it. Safe on a second monitor. `npm run dashboard` opens a tab regardless — there is no board to cover. |
+| `COACH_PORT` | `7171` | Port for the dashboard, on `127.0.0.1` only. |
 
 Only Inaccuracy, Mistake, Blunder and Brilliant are narrated. Asking a model to
 explain a good move invites it to invent a fault, so the rest are left alone —
@@ -483,8 +877,11 @@ which also keeps a full game well under a cent.
 ## Tests
 
 ```
-npm test                  122 tests, including live Stockfish
+npm test                  320 tests, including live Stockfish
 node tools/demo.mjs       grade known positions end to end, no board needed
+node tools/review.mjs     what you keep getting wrong; --deep to re-grade
+node tools/dashboard.mjs  the review dashboard, without playing
+node tools/play.mjs --dry-run  the drill deck and this session's picks
 node tools/probe.mjs      watch recognition only: no engine, no coach, no overlay
 node tools/find-board.mjs look for the board, change nothing
 node tools/log-summary.mjs  what happened in the last session
@@ -509,6 +906,12 @@ src/engine.js     Stockfish over UCI
 src/watch.js      when a detected move is real (settled, fits, beats standing still)
 src/grade.js      engine evaluations -> a graded move
 src/verdict.js    win probability and labels
+src/review.js     graded moves -> the habit behind them, no engine needed
+src/report.js     the review page, and where reviews are kept
+src/dashboard.js  serves that page on localhost, refreshed as you play
+src/play.js       which of your lost positions to replay, and when you may move on
+src/play-server.js the play session: the coach pointed at a position, not a screen
+src/play-page.js  the board you play on; it knows no chess
 src/coach.js      the one place a language model is used
 src/hint.js       the coaching topics behind t / w / c
 src/audit.js      what is weak in your position, no engine needed

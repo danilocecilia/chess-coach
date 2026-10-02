@@ -33,8 +33,8 @@ import { Chess } from 'chess.js';
 import { LOG_DIR, STOCKFISH, DEPTH } from '../src/config.js';
 import { Engine } from '../src/engine.js';
 import { gradeMove, toUci } from '../src/grade.js';
-import { reviewGame, reviewAll, summarise, FAULTS } from '../src/review.js';
-import { saveReview, rebuild, titleOf, REPORT_FILE } from '../src/report.js';
+import { reviewGame, reviewAll, summarise, gamesFromLog, FAULTS } from '../src/review.js';
+import { saveReview, loadReview, rebuild, titleOf } from '../src/report.js';
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(name);
@@ -43,6 +43,7 @@ const opts = {
   deep: flag('--deep'),
   all: flag('--all'),
   open: flag('--open'),
+  force: flag('--force'),
   pgn: value('--pgn'),
   color: value('--color'),
   depth: Number(value('--depth') ?? DEPTH),
@@ -77,37 +78,6 @@ function events(dir) {
     try { out.push(JSON.parse(line)); } catch { /* truncated tail */ }
   }
   return out;
-}
-
-/* ------------------------------------------------------------- instant ---- */
-
-/**
- * The grades as they were given, split into games.
- *
- * A session can hold more than one game: the coach recognises a fresh start
- * position and begins again rather than staying lost, and `newgame` marks
- * exactly where. Splitting on it keeps game 2's blunders out of game 1's
- * report.
- */
-function liveGames(dir) {
-  const evs = events(dir);
-  const start = evs.find((e) => e.ev === 'start');
-  const cuts = evs.filter((e) => e.ev === 'newgame' && e.ok).map((e) => e.seq);
-  const grades = evs.filter((e) => e.ev === 'grade');
-
-  const games = [];
-  let from = 0;
-  for (const cut of [...cuts, Infinity]) {
-    games.push(grades.filter((g) => g.seq >= from && g.seq < cut));
-    from = cut;
-  }
-  return games.map((moves, i) => ({
-    moves,
-    color: start?.playerColor,
-    plies: moves.length,
-    source: 'live',
-    n: i + 1,
-  }));
 }
 
 /* ---------------------------------------------------------------- deep ---- */
@@ -148,6 +118,7 @@ async function deepGame(engine, pgnText, depth, onMove) {
       fenBefore: g.fenBefore, fenAfter: g.fenAfter,
       bestMove: g.bestMove, bestLine: (g.bestLine ?? []).slice(0, 8),
       refutation: (g.refutation ?? []).slice(0, 8), materialSwing: g.materialSwing,
+      exchange: g.exchange, floored: g.floored,
     });
     // The search we already paid for, in the frame the next move needs it.
     pre = { fen: g.fenAfter, analysis: g.afterAnalysis };
@@ -164,6 +135,13 @@ async function reviewSession(dir, engine) {
   const session = path.basename(dir);
   const out = [];
 
+  // Which side you were on, per game of this session. The deep path needs this
+  // as much as the live one does — it grades both sides, so the colour is what
+  // decides whose review it is — and `gamesFromLog` is where that is tracked
+  // properly through a flip or a new game.
+  const played = existsSync(path.join(dir, 'session.jsonl'))
+    ? gamesFromLog(events(dir)) : [];
+
   if (opts.deep) {
     const files = pgnsOf(dir);
     for (const [i, file] of files.entries()) {
@@ -171,20 +149,19 @@ async function reviewSession(dir, engine) {
       const graded = await deepGame(engine, text, opts.depth,
         (at, of) => progress(`${session}/${file}  ${at}/${of} plies`));
       if (!graded?.length) { settled(`${session}/${file}  (no moves)`); continue; }
-      const start = existsSync(path.join(dir, 'session.jsonl'))
-        ? events(dir).find((e) => e.ev === 'start') : null;
-      const color = opts.color ?? start?.playerColor;
-      out.push(finish(graded, { color, session, n: i + 1, of: files.length, source: 'deep' }));
+      out.push(finish(graded, {
+        color: opts.color ?? played[i]?.color,
+        session, n: i + 1, of: files.length, source: 'deep',
+      }));
       settled(`${session}/${file}  ${graded.length} plies graded`);
     }
     return out;
   }
 
-  const live = liveGames(dir);
-  for (const g of live) {
+  for (const g of played) {
     if (!g.moves.length) continue;
     out.push(finish(g.moves, {
-      color: opts.color ?? g.color, session, n: g.n, of: live.length, source: 'live',
+      color: opts.color ?? g.color, session, n: g.n, of: played.length, source: 'live',
     }));
   }
   return out;
@@ -192,7 +169,14 @@ async function reviewSession(dir, engine) {
 
 /** One reviewed game, with the bits the page needs to label it. */
 function finish(graded, { color, session, n, of, source }) {
-  const r = reviewGame(graded, { color });
+  let r = reviewGame(graded, { color });
+  /*
+   * A colour that explains none of the moves explains nothing. Rather than
+   * report a game as empty, fall back to letting the review read the side off
+   * the moves themselves — which is what it does when no colour is given at
+   * all, and which cannot be wrong about a session that grades one side.
+   */
+  if (!r.graded && graded.length) r = reviewGame(graded);
   return {
     ...r,
     id: `${session}#${n}`,
@@ -251,10 +235,23 @@ async function main() {
     } else {
       for (const dir of dirs) {
         const games = await reviewSession(dir, engine);
-        // Only overwrite a stored review when this run actually produced one:
-        // an instant pass over a session with no graded moves must not wipe the
-        // deep review someone ran over the same session yesterday.
-        if (games.length) saveReview(dir, games);
+        if (!games.length) continue;    // nothing here; leave what is on disk
+
+        /*
+         * A deep review is strictly better than a live one — every move, both
+         * sides, one depth — so a later `--all` pass must not quietly downgrade
+         * it back. This is the same instinct as the recovery ladder in
+         * `main.js`: never replace something proven with something weaker
+         * without being told to.
+         */
+        const held = loadReview(dir);
+        if (!opts.force && games[0].source === 'live' && held?.[0]?.source === 'deep') {
+          console.log(`  ${path.basename(dir)}  keeping the deeper review already on disk`
+            + ' (--force to replace it)');
+          reviewed.push(...held);
+          continue;
+        }
+        saveReview(dir, games);
         reviewed.push(...games);
       }
     }

@@ -33,8 +33,8 @@
  */
 
 import { Chess } from 'chess.js';
-import { material, netMaterial, pvToSan, toUci } from './grade.js';
-import { materialWord } from './verdict.js';
+import { exchangeSwing, hangingCapture, netMaterial, pvSteps, pvToSan } from './grade.js';
+import { materialWord, scoreToWinProb } from './verdict.js';
 import { kingSafety } from './audit.js';
 import { nullMoveFen } from './threat.js';
 
@@ -180,38 +180,16 @@ function standing(fenBefore, m1, you) {
 }
 
 /**
- * What the move costs *now*, over the capture sequence that answers it.
+ * What the move costs over the capture sequence that answers it.
  *
- * Not `materialSwing`, which nets the whole principal variation. That is the
- * right measure for "what does this line finally win" — it is what `netMaterial`
- * exists for, and why it counts at the end of a pv rather than at a fixed ply —
- * and it is the wrong measure for "what did this move drop", because a piece
- * handed over now and a pawn structure repaired nine plies later come out as
- * zero.
+ * Lives in `grade.js` because the grader needs the same number: it is what the
+ * material floor in `classify` is applied to. The long argument for measuring
+ * it this way rather than over the whole pv is on the function itself.
  *
- * Both failures were measured on one real game. `Ng5` is met by `Qxg5` and the
- * knight is simply gone; over the full line the material came back and the move
- * was filed as a *positional* concession while losing 65% of the win
- * probability. In the same game a 15% inaccuracy was announced as leaving you
- * "a queen down", because the engine's line went on to a queen trade neither
- * side was forced into.
- *
- * So: play out the captures and stop at the first quiet move. That is the
- * exchange the move actually invited, and it is over by the time anybody has a
- * choice about anything else.
+ * Recomputed here rather than read off `g.exchange` so that a session logged
+ * before the grader recorded it still reviews correctly.
  */
-function immediateSwing(g, you) {
-  if (!g.refutation?.length) return 0;
-  const chess = new Chess(g.fenAfter);
-  let plies = 0;
-  for (const uci of g.refutation) {
-    const m = chess.moves({ verbose: true }).find((x) => toUci(x) === uci);
-    if (!m?.captured) break;                        // the sequence has gone quiet
-    chess.move(m);
-    plies++;
-  }
-  return plies ? material(chess.fen(), you) - material(g.fenBefore, you) : 0;
-}
+const immediateSwing = (g, you) => exchangeSwing(g.fenBefore, g.fenAfter, g.refutation, you);
 
 /** Pieces of `color` that `from` attacks, worth at least `worth`. */
 function hitsFrom(chess, from, color, worth) {
@@ -234,9 +212,15 @@ function hitsFrom(chess, from, color, worth) {
  *
  * @param {object} g  a graded move: fenBefore/fenAfter, refutation, bestLine,
  *                    bestMove, materialSwing, scoreBefore/After
+ * @param {object} [o]
+ * @param {boolean} [o.nameBest] two of these sentences end in "— Nf6 instead",
+ *                    which is the right way to read a *finished* game and the
+ *                    wrong way to read one you are still being asked to solve.
+ *                    A drill passes false and decides for itself when the move
+ *                    is given up; see the ladder in `play.js`.
  * @returns {{kind: string, text: string, line: string|null}|null}
  */
-export function faultOf(g) {
+export function faultOf(g, { nameBest = true } = {}) {
   if (!g?.fenBefore || !g.fenAfter) return null;
 
   const you = g.mover ?? new Chess(g.fenBefore).turn();
@@ -249,7 +233,7 @@ export function faultOf(g) {
   // one you left standing there. Same loss, different mistake.
   const traded = g.san?.includes('x') ?? false;
   const bestSan = g.bestMove ? pvToSan(g.fenBefore, [g.bestMove], 1) : null;
-  const instead = bestSan ? ` — ${bestSan} instead` : '';
+  const instead = nameBest && bestSan ? ` — ${bestSan} instead` : '';
 
   /*
    * Mate first, and before any material test, because a mating attack is
@@ -288,9 +272,12 @@ export function faultOf(g) {
         };
       }
       if (traded) {
+        // A recapture on the same square prints the same SAN as your own move,
+        // and "Nxd5 ... — Nxd5 answers" reads like a typo rather than a reply.
+        const answer = m1.san === g.san ? `he takes back on ${m1.to}` : `${m1.san} answers`;
         return {
           kind: 'lost-material',
-          text: `${g.san} starts an exchange that loses it — ${m1.san} answers`
+          text: `${g.san} starts an exchange that loses it — ${answer}`
             + (materialWord(swing) ? `, and you come out ${materialWord(swing)} down` : ''),
           line,
         };
@@ -310,6 +297,39 @@ export function faultOf(g) {
         line,
       };
     }
+  }
+
+  /*
+   * The same fault, reached when the engine's line does not happen to take it.
+   *
+   * Every branch above reads the refutation, which is sound while the position
+   * is competitive and unreliable once it is not: a side that is winning six
+   * ways has no reason to return the line that picks up the loose piece. On the
+   * game this was written for, `Bb2` hung a bishop and `Re7` hung a rook, and
+   * on a re-grade neither pv began with the capture — so the branches above saw
+   * nothing and the move came back "a positional concession", or worse, a
+   * *missed win*, while a piece stood there to be taken.
+   *
+   * So ask the board instead, exactly as the grade's material floor does. This
+   * has to agree with the label: a move floored to Mistake for hanging a piece
+   * and then explained as positional is worse than either alone.
+   */
+  const hung = hangingCapture(g.fenAfter, you);
+  if (hung && hung.points >= 2) {
+    const what = `your ${NAME[hung.move.captured]} on ${hung.move.to}`;
+    const cost = materialWord(hung.points) ?? `${hung.points} points`;
+    if (standing(g.fenBefore, hung.move, you)) {
+      return {
+        kind: 'missed-threat',
+        text: `${what} was already attacked before ${g.san}, and ${hung.move.san} still wins it`,
+        line: hung.move.san,
+      };
+    }
+    return {
+      kind: 'hung',
+      text: `${g.san} leaves ${what} there for nothing — ${hung.move.san} wins ${cost}`,
+      line: hung.move.san,
+    };
   }
 
   /*
@@ -399,20 +419,218 @@ export function faultOf(g) {
   };
 }
 
-/** How each fault reads as a heading, and as a thing to go and work on. */
+/**
+ * How each fault reads as a heading, as a thing to go and work on, and as
+ * something to learn from.
+ *
+ * `title` and `work` are the terminal's: `summarise()` and `tools/review.mjs`
+ * print them, and they must stay one line each. The rest is the page's, and it
+ * is the difference between a report that names your mistake and one you get
+ * better from:
+ *
+ *   what       what the fault actually is, in a sentence
+ *   why        why a human makes it — the attention failure behind it, not a
+ *              restatement of the rule. This is the part that transfers: you
+ *              cannot watch for a mistake you only know the name of
+ *   checklist  what to do at the board, in order, while you still have the move
+ *   drill      one thing to practise away from a game
+ *
+ * Written here, by hand, and not generated. Same rule as the rest of this file
+ * and as `audit.js`: a model asked "why do players hang pieces" produces
+ * plausible text that varies per run and is accountable to nobody, where the
+ * honest answer is a short fixed piece of chess knowledge that either is or is
+ * not good advice. It is also the one part of the page that must read the same
+ * way twice, because it is the part you are supposed to remember.
+ */
 export const FAULTS = {
-  'allowed-mate':  { title: 'Walking into mate',  work: 'check what his last move opened up before you commit to yours' },
-  hung:            { title: 'Hanging pieces',     work: 'before you move, look at what of yours is undefended' },
-  'missed-threat': { title: 'Ignoring his threat', work: 'after every one of his moves, ask what it is now attacking' },
-  fork:            { title: 'Forks and double attacks', work: 'watch squares that touch two of your pieces at once' },
-  'lost-material': { title: 'Losing exchanges',   work: 'count attackers and defenders before entering a trade' },
-  'missed-win':    { title: 'Missing what was there', work: 'when something of his is loose, look for the move that takes it' },
-  'king-safety':   { title: 'King safety',        work: 'castle earlier, and keep the king off open files' },
-  positional:      { title: 'Positional drift',   work: 'nothing hangs in these — this is the slow kind, worth a look with an engine' },
-  unknown:         { title: 'Not classified',     work: 're-run with --deep to have the engine say why these were bad' },
+  'allowed-mate': {
+    title: 'Walking into mate',
+    work: 'check what his last move opened up before you commit to yours',
+    what: 'Your move let a forced mate begin. Material stops counting the moment the king cannot be saved.',
+    why: 'Mate arrives while you are counting something else. Checks and captures near your king change a position much faster than a material plan does, so a move that is right about the pawns can be losing on the spot.',
+    checklist: [
+      'After your candidate move, list every check he has — all of them, not the good-looking ones.',
+      'For each check, find where your king goes. One legal square is a warning.',
+      'Count his pieces aimed at your king against the ones defending it.',
+      'If the count is against you, spend the move on defence. A tempo is cheaper than the game.',
+    ],
+    drill: 'Take the position before the mate, find his mating move yourself, then find the quiet move that would have stopped it.',
+  },
+  hung: {
+    title: 'Hanging pieces',
+    work: 'before you move, look at what of yours is undefended',
+    what: 'You left a piece where it could simply be taken.',
+    why: 'You checked what his last move threatened and not what your move stopped defending. A piece is usually hung by the move that walks away from it, not by the move that put it there — which is why it feels like it came from nowhere.',
+    checklist: [
+      'Picture the board as it will be after your move, not as it is now.',
+      'Name every piece of yours that nothing defends.',
+      'For each one, count his attackers.',
+      'Only then play the move.',
+    ],
+    drill: 'For one whole game, say your undefended pieces out loud before every move. It costs ten seconds and it is the cheapest habit on this page.',
+  },
+  'missed-threat': {
+    title: 'Ignoring his threat',
+    work: 'after every one of his moves, ask what it is now attacking',
+    what: 'Something of yours was already attacked, and your move looked somewhere else.',
+    why: 'Attention follows your own plan. His move changed the position and you answered the position before it. This costs more than hanging a piece, because you were told first.',
+    checklist: [
+      'Every time he moves, ask one question before anything else: what does that move now attack?',
+      'Follow the line it opened as well as the piece he touched — a bishop step uncovers a rook.',
+      'Answer it, make a bigger threat, or prove it is not real.',
+      'Only then go back to your own plan.',
+    ],
+    drill: 'Replay this game and, at each of his moves, name the threat out loud before you look at your reply.',
+  },
+  fork: {
+    title: 'Forks and double attacks',
+    work: 'watch squares that touch two of your pieces at once',
+    what: 'One piece of his hit two of yours at once, so answering one loses the other.',
+    why: 'Two pieces are safe individually and unsafe as a pair. Knights do most of this because their pattern is the one no other piece can cover, and checks do the rest, because a check is a threat you are not allowed to ignore.',
+    checklist: [
+      'Look for squares that touch two of your pieces — knight squares first.',
+      'Watch your king and queen sharing a rank, file, diagonal or knight-distance.',
+      'Ask whether he can reach one of those squares safely.',
+      'Defend it, move one of the pair, or take the square away.',
+    ],
+    drill: 'In the position before the fork, put his knight on every empty square in turn and see which ones hit two of yours. The pattern is what you are training, not the position.',
+  },
+  'lost-material': {
+    title: 'Losing exchanges',
+    work: 'count attackers and defenders before entering a trade',
+    what: 'You went into a sequence of captures that came out against you.',
+    why: 'Counting the first capture is easy and counting the whole sequence is not. The usual error is a defender that does not really defend — it is pinned, it is already busy holding something else, or he can chase it away first.',
+    checklist: [
+      'Count attackers and defenders on the square, cheapest piece first on both sides.',
+      'Check each of your defenders is actually free to recapture.',
+      'Play the sequence out to the end, not to the first recapture.',
+      'If it comes out level, ask whether you want the position it leaves.',
+    ],
+    drill: 'Count each of these exchanges again slowly and find the defender that was not one.',
+  },
+  'missed-win': {
+    title: 'Missing what was there',
+    work: 'when something of his is loose, look for the move that takes it',
+    what: 'Something of his was free, or a forced win was on, and your move passed it up.',
+    why: 'You were following your plan while the position changed underneath it. Gifts appear right after his mistakes, which is exactly when you are least likely to be looking for one.',
+    checklist: [
+      'Before continuing your plan, scan his loose pieces — undefended, or defended only once.',
+      'Look at every check and every capture you have, including the ones that look silly.',
+      'Ask what his last move stopped defending.',
+      'Then go back to the plan.',
+    ],
+    drill: 'Find the winning move in each of these without reading the answer. Every one of them was on the board in front of you at the time.',
+  },
+  'king-safety': {
+    title: 'King safety',
+    work: 'castle earlier, and keep the king off open files',
+    what: 'Your king was already exposed, and this move did not deal with it.',
+    why: 'King safety is the one weakness that costs nothing until it costs everything. Nothing is hanging, the evaluation looks fine, and then the attack arrives with tempo and there is no move left that defends.',
+    checklist: [
+      'Castle early unless there is a concrete reason not to.',
+      'Keep the pawns in front of your king where they are; each one pushed is a door.',
+      'Count his attackers near your king against your defenders — not his whole army against yours.',
+      'When the count is against you, trade attackers off. Every swap helps the defender.',
+    ],
+    drill: 'From these positions, work out his attacking plan three moves deep. Seeing the attack coming is what makes the defensive move obvious.',
+  },
+  positional: {
+    title: 'Positional drift',
+    work: 'nothing hangs in these — this is the slow kind, worth a look with an engine',
+    what: 'Nothing was taken. The move made your position slightly worse: a weakened square, a worse piece, a file handed over.',
+    why: 'These do not feel like mistakes, which is exactly what makes them habits. Each costs little and they compound, and by the time the position is unpleasant there is no single move to point at.',
+    checklist: [
+      'Before a quiet move, say what it improves.',
+      'Find your worst-placed piece and ask whether this move helps it.',
+      'Prefer a move that improves a piece to a move that merely does something.',
+      'Check what it gives up permanently — a square or a pawn structure does not come back.',
+    ],
+    drill: 'For each of these, compare your move with the engine\'s for two minutes and write the difference down in one sentence.',
+  },
+  unknown: {
+    title: 'Not classified',
+    work: 're-run with --deep to have the engine say why these were bad',
+    what: 'The log did not carry enough for the review to say what went wrong.',
+    why: 'Either a session recorded before grades carried positions and lines, or a move the coach graded while the board was out of sync.',
+    checklist: ['Re-run:  node tools/review.mjs --deep --all'],
+    drill: 'A deep review grades every move of the saved game from scratch, and these will classify themselves.',
+  },
 };
 
 /* -------------------------------------------------------------- review ---- */
+
+/**
+ * The position and the two moves, kept so the review can be *shown* and not
+ * only described.
+ *
+ * Everything here was already searched and already written to the log
+ * (`src/main.js` records `fenBefore`, `uci`, `bestMove` and `bestLine` for
+ * exactly this reason), and then thrown away at this line for as long as the
+ * report was a page of sentences. A sentence about a position you cannot see is
+ * the weakest form this analysis can take: "your knight on d4 had nothing
+ * defending it" is a fact you read, and the same position with the move hidden
+ * is a fact you have to find, which is the one that stays.
+ *
+ * Carried only on moves that have a fault. The page inlines its whole dataset,
+ * so a FEN on all 40 moves of every game is size spent on rows nothing draws —
+ * and the trainer and the fault lists, which are the only things that show a
+ * board, are built from bad moves alone.
+ *
+ * Returns null when the grade predates this being logged. That is not an error
+ * and must not become one: the page degrades to the sentence it has today and
+ * says which sessions need re-reviewing.
+ */
+function evidenceOf(g) {
+  if (!g?.fenBefore) return null;
+  return {
+    fen: g.fenBefore,
+    // from/to rather than SAN, so the page can highlight the squares without
+    // carrying a SAN parser into the browser to find out where the move went.
+    uci: g.uci ?? null,
+    best: g.bestMove ? pvToSan(g.fenBefore, [g.bestMove], 1) : null,
+    bestUci: g.bestMove ?? null,
+    bestLine: g.bestLine?.length ? pvToSan(g.fenBefore, g.bestLine, 6) : null,
+    /*
+     * The same two lines again, walked out ply by ply, for the page to play.
+     *
+     * A bad move is rarely bad by itself — it is bad for the answer it allows,
+     * and "He answers: Rxd4 Ke7" asks the reader to build that answer in their
+     * head from the position they are looking at. These are the two lines the
+     * text above already names, in the one form the browser can move a piece
+     * with: `{ uci, san }`, so the board animates from the UCI and the caption
+     * reads in the notation everything else on the page is written in.
+     *
+     * `refutation` was searched from the position *after* the move, so your own
+     * move goes in front of it to make one line playable from `fen` — which is
+     * also how it should be watched: the mistake, then the punishment.
+     *
+     * Cut to 6 plies each, the same lengths the sentences use, so the animation
+     * and the text cannot tell different stories. ~240 bytes on a move that has
+     * a fault, and nothing at all on the moves that do not: the same trade the
+     * FEN above is here on.
+     */
+    playedLine: g.uci ? pvSteps(g.fenBefore, [g.uci, ...(g.refutation ?? [])], 6) : null,
+    betterLine: g.bestLine?.length ? pvSteps(g.fenBefore, g.bestLine, 6) : null,
+  };
+}
+
+/**
+ * Win probability either side of the move, for the curve that shows where a
+ * game was actually decided.
+ *
+ * Preferred off the grade, which computed it at the time; derived from the
+ * score only as a fallback. Not derived when there is no score at all —
+ * `scoreToWinProb(null)` answers 50, and a flat 50 is indistinguishable from a
+ * genuinely level position, which would draw a curve through moves nobody ever
+ * evaluated.
+ */
+const winOf = (have, score) => {
+  const v = have ?? (score != null ? scoreToWinProb(score) : null);
+  // One decimal. This lands on every graded move of every game and is inlined
+  // into the page as text, where `51.1044443209752` is 12 characters of nothing:
+  // it is drawn as a point on a 120px chart.
+  return v == null ? null : Math.round(v * 10) / 10;
+};
 
 /**
  * One game, reviewed.
@@ -441,9 +659,25 @@ export function reviewGame(grades, { color, ...meta } = {}) {
     labels[name] = (labels[name] ?? 0) + 1;
 
     const phase = g.fenBefore ? phaseOf(g.fenBefore) : 'middlegame';
-    phases[phase] ??= { moves: 0, lost: 0 };
+    /*
+     * Accuracy is accumulated per phase, not only loss.
+     *
+     * Win probability lost per move answers "where does it go wrong" and
+     * nothing else: it is unbounded, so one blunder in a short endgame outranks
+     * a whole sloppy middlegame. Accuracy is the same measure the rest of the
+     * page is stated in, and it is bounded, so the three phases can be compared
+     * to each other and to your overall figure.
+     *
+     * `accMoves` is counted separately from `moves` so that a page built from a
+     * mix of old and new reviews averages over the moves that actually carried
+     * an accuracy, instead of dividing by a count that includes rows written
+     * before this existed.
+     */
+    phases[phase] ??= { moves: 0, lost: 0, acc: 0, accMoves: 0 };
     phases[phase].moves++;
     phases[phase].lost += g.drop ?? 0;
+    phases[phase].acc += moveAccuracy(g.drop ?? 0);
+    phases[phase].accMoves++;
 
     // `faultOf` is only asked about moves that cost something. Explaining why a
     // Best move was best is a different feature, and a worse one: it would fill
@@ -452,7 +686,11 @@ export function reviewGame(grades, { color, ...meta } = {}) {
     const row = {
       ply: g.ply ?? null, san: g.san, label: name, drop: g.drop ?? 0, phase,
       scoreBefore: g.scoreBefore ?? null, scoreAfter: g.scoreAfter ?? null,
+      // Both in the mover's frame, as `classify` and `gradeMove` leave them, so
+      // a curve of these is the game from your side of the board.
+      winBefore: winOf(g.winBefore, g.scoreBefore), winAfter: winOf(g.winAfter, g.scoreAfter),
       fault: fault?.kind ?? null, why: fault?.text ?? null, line: fault?.line ?? null,
+      ...(fault ? evidenceOf(g) ?? {} : {}),
     };
     moves.push(row);
 
@@ -464,6 +702,26 @@ export function reviewGame(grades, { color, ...meta } = {}) {
       faults.set(fault.kind, f);
     }
   }
+
+  /*
+   * The same fault twice in one game.
+   *
+   * Worth separating from the count across games, because they are different
+   * news. Hanging a piece in six games out of twenty is a weakness; hanging two
+   * in the same game is the weakness running unattended — the first one was
+   * pointed at you, on the board, minutes earlier, and the habit carried on
+   * regardless. That is the clearest signal available here that a fault is
+   * worth drilling rather than noting.
+   */
+  const at = new Map();
+  for (const m of moves) {
+    if (!m.fault) continue;
+    at.set(m.fault, [...(at.get(m.fault) ?? []), m.ply]);
+  }
+  const repeats = [...at.entries()]
+    .filter(([, plies]) => plies.length >= 2)
+    .map(([kind, plies]) => ({ kind, count: plies.length, plies: plies.filter((p) => p != null) }))
+    .sort((a, b) => b.count - a.count);
 
   const lost = mine.reduce((a, g) => a + (g.drop ?? 0), 0);
   return {
@@ -479,12 +737,89 @@ export function reviewGame(grades, { color, ...meta } = {}) {
     // Ranked by what each habit actually cost, not by how often it happened: a
     // single blunder that threw the game outranks four inaccuracies.
     faults: [...faults.values()].sort((a, b) => b.cost - a.cost),
+    repeats,
     worst: moves.filter(isBadRow).sort((a, b) => b.drop - a.drop).slice(0, 5),
     moves,
   };
 }
 
 const isBadRow = (m) => BAD.includes(m.label);
+
+/**
+ * Oldest game first, whoever asked.
+ *
+ * A trend has to know which end is now, and the two callers disagree: the page
+ * rebuilds newest-first because that is the reading order, while
+ * `tools/review.mjs` walks sessions in sort order, which is oldest-first.
+ * Depending on either would silently invert every verdict for one of them —
+ * "improving" and "getting worse" are the same numbers read the other way
+ * round, and nothing downstream could catch it.
+ *
+ * So order is taken from the id the reviews are stored under, `<session>#<n>`,
+ * where the session is a timestamp directory. The game number is compared as a
+ * number, or `#10` would sort before `#2`. Games with no id keep the order they
+ * arrived in, which is all that can be said about them.
+ */
+export function chronological(games) {
+  const key = (g) => {
+    const m = /^(.*)#(\d+)$/.exec(g.id ?? '');
+    return m ? [m[1], Number(m[2])] : null;
+  };
+  return [...(games ?? [])].sort((a, b) => {
+    const ka = key(a), kb = key(b);
+    if (!ka || !kb) return 0;
+    return ka[0] < kb[0] ? -1 : ka[0] > kb[0] ? 1 : ka[1] - kb[1];
+  });
+}
+
+/** A fault happening this often per 10 of your moves, which is the comparable rate. */
+const per10 = (cost, graded) => (graded ? (cost / graded) * 10 : 0);
+
+/**
+ * Is this habit getting better?
+ *
+ * The question the whole report is for, and the one place on the page that
+ * could flatter you with noise, so the bar it has to clear is stated rather
+ * than buried:
+ *
+ *   - measured as cost per 10 of your moves, never per game. Games differ in
+ *     length by a factor of three here, and a rate is the only thing two of
+ *     them can be compared on.
+ *   - the newer half against the older half, not last-game-against-previous.
+ *     One game is a mood.
+ *   - four games with the habit in view before any verdict at all, and at least
+ *     two games where it actually happened. A line drawn through one event is
+ *     not a direction.
+ *   - a ±15% band in the middle reads as flat, because a 4% move in a number
+ *     built out of blunders is not evidence of anything.
+ *
+ * Refusing is a normal outcome here and the page prints the reason.
+ *
+ * @param {object[]} history  per-game `{ per10, count }`, oldest first
+ */
+export function trendOf(history, { min = 4, band = 0.15 } = {}) {
+  const h = history ?? [];
+  const seen = h.filter((x) => x.count > 0).length;
+  if (h.length < min) {
+    return { verdict: 'unknown', games: h.length, reason: `only ${h.length} game${h.length === 1 ? '' : 's'} with this so far` };
+  }
+  if (seen < 2) {
+    return { verdict: 'unknown', games: h.length, reason: 'it has only happened once' };
+  }
+
+  // Equal halves. On an odd count the middle game belongs to neither, which is
+  // the honest way to split it and keeps the two means the same weight.
+  const half = Math.floor(h.length / 2);
+  const mean = (a) => a.reduce((s, x) => s + x.per10, 0) / a.length;
+  const was = mean(h.slice(0, half));
+  const now = mean(h.slice(h.length - half));
+  const change = was > 0 ? (now - was) / was : now > 0 ? 1 : 0;
+
+  return {
+    verdict: Math.abs(change) <= band ? 'flat' : change < 0 ? 'improving' : 'worsening',
+    was, now, change, games: h.length,
+  };
+}
 
 /**
  * Every game together — which is the only view that can answer the question
@@ -495,7 +830,7 @@ const isBadRow = (m) => BAD.includes(m.label);
  * are the evidence under it.
  */
 export function reviewAll(games) {
-  const played = (games ?? []).filter((g) => g && g.graded > 0);
+  const played = chronological((games ?? []).filter((g) => g && g.graded > 0));
   const faults = new Map();
 
   for (const game of played) {
@@ -504,9 +839,38 @@ export function reviewAll(games) {
       at.count += f.count;
       at.cost += f.cost;
       at.games++;
-      at.moves.push(...f.moves.map((m) => ({ ...m, game: game.id })));
+      at.moves.push(...f.moves.map((m) => ({ ...m, game: game.id, when: game.title })));
       faults.set(f.kind, at);
     }
+  }
+
+  /*
+   * The history a trend is drawn through, and the reason it includes games
+   * where the fault did *not* happen.
+   *
+   * Listing only the games that show a fault is the obvious thing and it makes
+   * the one outcome you are working for invisible: a habit you have fixed stops
+   * appearing, so its history simply stops, and the last few points are the
+   * games where you still had it. Read as a trend that says "no change", right
+   * up to the point the fault disappears from the page altogether.
+   *
+   * Counting a clean game as a zero is what makes "improving" mean it stopped.
+   * The span starts at the first game the fault appeared in — there is nothing
+   * to say about a habit you had not exhibited yet, and padding the front with
+   * zeros would report every newly-noticed fault as getting worse.
+   */
+  for (const [kind, at] of faults) {
+    const first = played.findIndex((g) => (g.faults ?? []).some((f) => f.kind === kind));
+    at.history = played.slice(first).map((g) => {
+      const f = (g.faults ?? []).find((x) => x.kind === kind);
+      const cost = f?.cost ?? 0;
+      return {
+        id: g.id ?? null, title: g.title ?? null, cost, count: f?.count ?? 0,
+        per10: per10(cost, g.graded),
+      };
+    });
+    at.trend = trendOf(at.history);
+    at.repeatedGames = played.filter((g) => (g.repeats ?? []).some((r) => r.kind === kind)).length;
   }
 
   const graded = played.reduce((a, g) => a + g.graded, 0);
@@ -522,13 +886,85 @@ export function reviewAll(games) {
       .sort((a, b) => b.cost - a.cost),
     phases: played.reduce((acc, g) => {
       for (const [p, v] of Object.entries(g.phases ?? {})) {
-        acc[p] ??= { moves: 0, lost: 0 };
+        acc[p] ??= { moves: 0, lost: 0, acc: 0, accMoves: 0 };
         acc[p].moves += v.moves;
         acc[p].lost += v.lost;
+        // Absent on reviews written before phases carried accuracy. Adding zero
+        // for them would be a lie about their moves; leaving them out of both
+        // sums means the average is over the moves that have one.
+        acc[p].acc += v.acc ?? 0;
+        acc[p].accMoves += v.accMoves ?? 0;
+      }
+      return acc;
+    }, {}),
+    /*
+     * The same game split by which colour you had.
+     *
+     * A gap here is one of the few findings on this page that names its own
+     * fix: consistently worse as Black usually means the opening, because it is
+     * the half of the game where the two colours are actually playing different
+     * positions.
+     */
+    byColor: played.reduce((acc, g) => {
+      const c = g.color === 'b' ? 'b' : 'w';
+      acc[c] ??= { games: 0, graded: 0, acc: 0, accMoves: 0, lost: 0 };
+      acc[c].games++;
+      acc[c].graded += g.graded;
+      acc[c].lost += g.lost ?? 0;
+      if (g.accuracy != null) {
+        acc[c].acc += g.accuracy * g.graded;
+        acc[c].accMoves += g.graded;
       }
       return acc;
     }, {}),
   };
+}
+
+/**
+ * Split a session's events into games, with the side you were on for each.
+ *
+ * Pure, like everything else here — it takes the parsed events and returns
+ * groups of graded moves, so the file that reads the disk stays the one file
+ * that reads the disk.
+ *
+ * A session can hold more than one game: the coach recognises a fresh start
+ * position and begins again rather than staying lost, and `newgame` marks
+ * exactly where. Splitting on it keeps game 2's blunders out of game 1's report.
+ *
+ * ## The colour is tracked, not read once
+ *
+ * `start` records the colour at startup, and the coach can change it while
+ * running — `tryNewGame` may hand you the other colour, `tryFlip` corrects a
+ * board that was the other way round all along. Both write the new
+ * `playerColor` into the log, so the value in force is knowable exactly.
+ *
+ * Taking the startup one instead is not a small error. Measured on a real
+ * session: a new game was recognised the other way round two frames in, so all
+ * ten moves graded afterwards were White's while `start` still said Black — and
+ * the game reviewed as having no moves in it at all.
+ */
+export function gamesFromLog(events) {
+  const start = events.find((e) => e.ev === 'start');
+  const grades = events.filter((e) => e.ev === 'grade');
+  const cuts = events.filter((e) => e.ev === 'newgame' && e.ok);
+
+  const games = [];
+  let from = 0;
+  let color = start?.playerColor;
+  for (const cut of [...cuts, { seq: Infinity, playerColor: null }]) {
+    const within = (e) => e.seq >= from && e.seq < cut.seq;
+    const flips = events.filter((e) => e.ev === 'flip' && e.ok && within(e));
+    games.push({
+      moves: grades.filter(within),
+      // A flip inside the game is the later correction, so it has the last word.
+      color: flips.length ? flips[flips.length - 1].playerColor : color,
+      source: 'live',
+      n: games.length + 1,
+    });
+    from = cut.seq;
+    color = cut.playerColor ?? color;
+  }
+  return games;
 }
 
 /**

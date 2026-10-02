@@ -13,6 +13,7 @@
 
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { Chess } from 'chess.js';
 import { LOG_DIR } from '../src/config.js';
 
 /** Runs are named by timestamp, so the newest is the last in sort order. */
@@ -48,6 +49,44 @@ if (start) {
   console.log(`  ${start.region.w}x${start.region.h} at (${start.region.x}, ${start.region.y})`
     + `   you are ${start.playerColor === 'w' ? 'White' : 'Black'}`
     + `   ${start.flipped ? 'black' : 'white'} at bottom`);
+
+  /*
+   * Where that colour came from, not just what it was. A session that reported
+   * the wrong colour could not be argued with from a log that stated it as a
+   * bare fact, which is why the `start` event now carries its reasons.
+   */
+  const o = start.orientation;
+  if (o) {
+    if (o.facing?.changed) {
+      console.log(`    read off the board at startup (margin ${o.facing.margin.toFixed(1)} ranks)`
+        + ` — calibration had said the other way round`);
+    } else if (o.facing) {
+      console.log(`    confirmed off the board at startup`
+        + ` (margin ${o.facing.margin?.toFixed(1) ?? '—'} ranks)`);
+    } else {
+      console.log('    not confirmed against the board — taken from calibration');
+    }
+    if (o.calibrated) {
+      const c = o.calibrated;
+      console.log(`    calibrated by ${c.decidedBy}: ink ${c.ink.white.toFixed(0)}`
+        + `/${c.ink.black.toFixed(0)} apart by ${c.ink.separation.toFixed(0)}`
+        + ` (needs ${c.ink.bar.toFixed(0)}), brightness`
+        + ` ${c.brightness.top.toFixed(0)}/${c.brightness.bottom.toFixed(0)}`
+        + `${c.agree ? '' : ' — DISAGREED'}`);
+    } else {
+      console.log('    templates predate orientation evidence — re-run calibrate to record it');
+    }
+    if (o.tone?.consistent === false) {
+      console.log(`    ! the templates call the darker men White (${o.tone.white.toFixed(0)}`
+        + ` against ${o.tone.black.toFixed(0)}) — they were learned the wrong way round,`
+        + ' and every move here was graded for the wrong player');
+    }
+    if (o.theme?.stale) {
+      console.log(`    ! board levels are ${o.theme.light >= 0 ? '+' : ''}${o.theme.light.toFixed(0)}`
+        + ` light / ${o.theme.dark >= 0 ? '+' : ''}${o.theme.dark.toFixed(0)} dark against the`
+        + ` templates — the theme changed`);
+    }
+  }
   console.log(`  squareLimit ${Math.round(start.limits.squareLimit)}`
     + `  threshold ${start.limits.threshold}  confidence ${start.limits.confidence}`
     + `  floor ${start.limits.floor ?? '—'}  allow ${start.limits.allow}`);
@@ -99,7 +138,11 @@ for (const e of interesting) {
     case 'replace':
       console.log(`${at}replaced    ${e.ok
         ? `OK: ${e.was} never happened — it was ${e.now}`
-        : `refused (${e.reason})${e.now ? ` — best instead of ${e.was} was ${e.now}` : ''}`}`);
+        // "confirmed" is the rung agreeing with us, not failing to run, and
+        // reading it as a refusal sent a real diagnosis down the wrong path.
+        : e.reason === 'confirmed'
+          ? `agreed: ${e.was} is still the best explanation of the board`
+          : `refused (${e.reason})${e.now ? ` — best instead of ${e.was} was ${e.now}` : ''}`}`);
       break;
     case 'resync':
       console.log(`${at}resync ${e.plies}ply  ${e.ok ? `OK: ${e.line.join(' ')}`
@@ -212,8 +255,100 @@ const first = events.find((e) => e.ev === 'desync');
 const born = first && first.seq <= 5 && first.wrong.length && first.wrong.length <= 3
   && !first.wrong.some((w) => w.occluded) ? first.wrong : null;
 
+/*
+ * Which episode the rest of the verdict is about.
+ *
+ * `first` is the right evidence for the test above — that one is specifically a
+ * claim about the opening frames — and the wrong evidence for everything below
+ * it. A session's *first* desync is usually a piece in mid-flight that cleared
+ * in half a second; the episode that ended the game often comes minutes later.
+ * On a real session this printed a confident takeback diagnosis drawn from the
+ * pawn moving to e4 at 3.8s, and said nothing at all about the 159 seconds of
+ * lost board that actually finished it.
+ *
+ * So: the episode that was never recovered, or failing that the longest one.
+ */
+const worst = [...episodes].sort((a, b) =>
+  (b.openEnded ? 1 : 0) - (a.openEnded ? 1 : 0)
+  || (b.until - b.t) - (a.until - a.t))[0];
+const fatal = (worst && events.find((e) => e.ev === 'desync' && e.seq >= worst.from)) || first;
+/*
+ * Whether anything had been applied by then. A takeback and a phantom move are
+ * both claims about a move we recorded, so neither is possible in a session that
+ * never recorded one — and the two-square shape they share is also what the very
+ * first move of a game looks like against an un-started board. Three sessions
+ * were filed as takebacks having applied zero plies.
+ */
+const appliedBefore = events.some((e) => e.ev === 'apply' && e.seq <= (fatal?.seq ?? -1));
+
+/*
+ * Is the two-square shape simply a move we missed?
+ *
+ * One square emptied and one filled is a single move's worth of difference, and
+ * three different things produce it: the board went back, the board went
+ * sideways, or the board went *forward* and we did not see it. The verdict below
+ * used to name the first two and assert the third away — "neither square is
+ * ahead of the tracked position" — without ever asking, on no evidence beyond
+ * having applied a move at some point earlier in the session.
+ *
+ * The question is one call to answer, so it is asked: is there a legal move out
+ * of the position we believed we were in that goes from the emptied square to
+ * the filled one, and does it leave the piece the pixels actually read? That is
+ * a plain missed move, the cheapest rung reaches it (`resync` walks every depth
+ * from 1), and a log showing it is a log about why that rung never ran — not
+ * about held pieces and takebacks. The session that found this was one ply ahead
+ * by `Nf6`, with `g8` emptied and `f6` filled, and was filed under BACKWARDS /
+ * SIDEWAYS for nine minutes.
+ */
+function missedMove(e) {
+  if (!e?.fen || e.wrong?.length !== 2 || e.wrong.some((w) => w.occluded)) return null;
+  const from = e.wrong.find((w) => w.best === '.');
+  const to = e.wrong.find((w) => w.want === '.');
+  if (!from || !to) return null;
+  try {
+    const moves = new Chess(e.fen).moves({ verbose: true });
+    // The piece that lands has to be the piece the pixels read, or this is some
+    // other move's shape wearing these two squares: a promotion reads as the new
+    // piece, and anything else is not this move.
+    return moves.find((m) => m.from === from.sq && m.to === to.sq
+      && m.color + (m.promotion ?? m.piece) === to.best)?.san ?? null;
+  } catch { return null; }
+}
+const missed = missedMove(fatal);
+
+/*
+ * A theme change outranks every other verdict, because it makes them all
+ * meaningless: with templates built for a different skin nothing fits, every
+ * rung fails for the right reasons, and the honest-looking conclusion is that a
+ * move was missed. A real session ended up being told "the screen was not the
+ * opening position" while the screen was showing exactly the opening position,
+ * which sent the search after a moved region that had never moved.
+ */
+const theme = start?.orientation?.theme;
+
 console.log('\nverdict');
-if (born) {
+if (start?.orientation?.tone?.consistent === false) {
+  // Ahead of the theme branch: a model that reads its board perfectly and
+  // names the sides backwards produces no lost sync at all, so this session
+  // may look entirely healthy while being wrong about the only thing that
+  // matters.
+  console.log('  The templates were learned the wrong way round. What they call White is');
+  console.log(`  drawn darker (${start.orientation.tone.white.toFixed(0)}) than what they call`
+    + ` Black (${start.orientation.tone.black.toFixed(0)}), so the board reads`);
+  console.log('  cleanly and every move in it is attributed to the wrong player — including');
+  console.log('  anything already written to the reports. Re-calibrate and replay the game:');
+  console.log('    npm run calibrate');
+} else if (theme?.stale) {
+  console.log('  The templates are not for this board. Its empty squares read'
+    + ` ${theme.light >= 0 ? '+' : ''}${theme.light.toFixed(0)} light and`
+    + ` ${theme.dark >= 0 ? '+' : ''}${theme.dark.toFixed(0)} dark`);
+  console.log('  against the ones calibration learned, which is a different board theme or');
+  console.log('  piece set — not a desync, and not a move that was missed. Nothing can be');
+  console.log('  graded until the templates match what is on screen:');
+  console.log('    npm run calibrate');
+  console.log('  To see it rather than take it on trust:');
+  console.log(`    node tools/frame-png.mjs ${dir} 1`);
+} else if (born) {
   const names = born.map((w) => w.sq).join(', ');
   console.log(`  Lost sync on frame ${first.seq}, before anything on the board had moved —`);
   console.log(`  so this is not drift. ${born.length > 1 ? 'These squares were' : `${names} was`}`
@@ -256,8 +391,21 @@ if (born) {
     ? ` (refused ${material.length}x, "material" above)` : ''}.`);
   console.log('  The ladder has a rung for exactly this, and it did not fire: either this');
   console.log('  log predates it, or a `new game refused` line above says what stopped it.');
-} else if (first && first.wrong.length === 2 && !first.wrong.some((w) => w.occluded)
-    && first.wrong.filter((w) => w.want === '.').length === 1) {
+} else if (missed) {
+  console.log('  Two squares changed, one emptied and one filled: exactly one move\'s worth.');
+  console.log(`    ${fatal.wrong.map(sq).join('  ')}`);
+  console.log(`  That is ${missed}, a legal move out of the position we believed we were in, so`);
+  console.log('  the board is one ply AHEAD of us — an ordinary missed move, not a takeback and');
+  console.log('  not a phantom. It is the cheapest thing the ladder recovers: the two-ply rung');
+  console.log('  walks every depth from one, so this position is the first thing it scores.');
+  console.log('  A log still showing it means that rung never ran, or ran and refused. If no');
+  console.log('  `resync` line appears above within a second or two of the desync, it never');
+  console.log('  ran — the ladder was not reached on these frames at all, which is a wiring');
+  console.log('  fault in the loop rather than anything about this board. If it did run, its');
+  console.log('  own line says why it refused.');
+} else if (fatal && appliedBefore && fatal.wrong.length === 2
+    && !fatal.wrong.some((w) => w.occluded)
+    && fatal.wrong.filter((w) => w.want === '.').length === 1) {
   /*
    * Two squares, one that gained a piece and one that lost one, is a single
    * move's worth of difference. Just after we accepted a move, that is the
@@ -265,7 +413,7 @@ if (born) {
    * confirmation dismissed — which no forward search can reach.
    */
   console.log('  Two squares changed, one emptied and one filled: exactly one move\'s worth.');
-  console.log(`    ${first.wrong.map(sq).join('  ')}`);
+  console.log(`    ${fatal.wrong.map(sq).join('  ')}`);
   console.log('  Neither square is ahead of the tracked position, so this is not a missed');
   console.log('  move, and no forward search reaches it. Two things look like this:');
   console.log('    BACKWARDS  the board returned to a position we were in — a takeback, a');
@@ -282,6 +430,33 @@ if (born) {
   console.log('  Lost sync, but the screen was not the opening position — so it is a missed');
   console.log('  or misread move, an animation, a flip or a moved region. Look at the first');
   console.log(`  frame of the first episode:\n    node tools/replay.mjs ${dir} --board ${episodes[0].from}`);
+  // Only where it has not already been ruled out. A stale-theme session takes
+  // the branch above; this is the remaining case where the templates might be
+  // for a different board and the log has no measurement to say so.
+  if (!start?.orientation) {
+    console.log('  If the board theme or piece set changed since calibration, that looks');
+    console.log(`  exactly like this. See it: node tools/frame-png.mjs ${dir} 1`);
+  }
 } else {
   console.log('  Nothing went wrong in this session.');
+}
+
+/*
+ * Not a verdict: a session whose orientation was corrected at startup worked,
+ * and worked *because* it was corrected. It is reported because the correction
+ * contradicts what calibration recorded, and a silent correction reads exactly
+ * like the bug it is fixing.
+ */
+const corrected = [
+  ...(start?.orientation?.facing?.changed ? [{ at: 'startup', ...start.orientation.facing }] : []),
+  ...events.filter((e) => e.ev === 'facing' && e.changed),
+];
+if (corrected.length) {
+  console.log('\norientation');
+  for (const c of corrected) {
+    console.log(`  ${c.at}: the board was read as ${c.flipped ? 'black' : 'white'} at bottom,`
+      + ` against what was in force (margin ${c.margin?.toFixed(1) ?? '—'} ranks) — corrected.`);
+  }
+  console.log('  If this happens every session, calibration has the board the wrong way round:');
+  console.log('    npm run calibrate');
 }

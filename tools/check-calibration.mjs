@@ -17,7 +17,8 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { BoardModel } from '../src/board.js';
+import { BoardModel, CODES, fenToGrid, LEARNED_FROM } from '../src/board.js';
+import { SQ_BYTES } from '../src/capture.js';
 import { BOARD_CONFIG, TEMPLATE_DIR } from '../src/config.js';
 
 const modelFile = path.join(TEMPLATE_DIR, 'model.json');
@@ -29,6 +30,7 @@ if (!existsSync(BOARD_CONFIG) || !existsSync(modelFile)) {
 const cfg = JSON.parse(readFileSync(BOARD_CONFIG, 'utf8'));
 const model = BoardModel.fromJSON(JSON.parse(readFileSync(modelFile, 'utf8')));
 
+const startGrid = fenToGrid(LEARNED_FROM, model.flipped);
 const contrastLimit = Math.round((model.contrast * 0.12) ** 2);
 console.log(`board  ${cfg.region.w}x${cfg.region.h} at (${cfg.region.x}, ${cfg.region.y})`
   + `   ${cfg.flipped ? 'black' : 'white'} at bottom   contrast ${model.contrast.toFixed(1)}`);
@@ -44,11 +46,56 @@ const problems = [];
  * this board's normal noise. Every later wrong square is then measured against
  * a limit sized by a decoration.
  */
-if (cfg.squareLimit > contrastLimit * 4) {
+/*
+ * The ratio at which this becomes worth saying is much higher than it looks,
+ * and the first version of this check was set inside the good population. On
+ * eleven real calibrations the ratio read 1.46-5.45 on the seven that worked —
+ * including 5.28 and 5.45 on the two boards that graded 29- and 26-move games —
+ * and 21.82 on the one that was genuinely blinded by a decoration. At 4x it
+ * therefore flagged the cleanest session in the corpus and would have talked
+ * someone into re-calibrating a board that was working, which is the one way a
+ * check like this can do harm. The safe interval is (5.45, 21.82]; 10 sits
+ * near its geometric centre.
+ *
+ * It is kept as a hint rather than a verdict because the ratio does not decide
+ * anything on its own — the blind-move sweep below does, and it needs no
+ * threshold at all.
+ */
+if (cfg.squareLimit > contrastLimit * 10) {
   problems.push(`squareLimit is ${(cfg.squareLimit / contrastLimit).toFixed(1)}x what this board's`
     + ` contrast implies (${cfg.squareLimit} against ${contrastLimit}).`
     + `\n    One square was far worse than the others when this was learned, and that`
     + `\n    square set the limit. A desync has to be this bad before anything notices.`);
+}
+
+/*
+ * Can this calibration see a move at all?
+ *
+ * The same question `npm run calibrate` now refuses on, asked without a screen.
+ * There is no frame here, so one is built from the templates: the appearance
+ * they predict for the start position *is* a perfect reading of it, and the cost
+ * of a move against that frame is exactly the template distance between the two
+ * positions. That is the quantity squareLimit has to sit below, so this tests
+ * the limit against the piece set it was derived from — which is the half of the
+ * failure a tool with no screen can still prove.
+ *
+ * A board that passes here can still be wrong in a way only a real frame shows;
+ * a board that fails here cannot work at all.
+ */
+const synthetic = new Uint8Array(64 * SQ_BYTES);
+for (let idx = 0; idx < 64; idx++) {
+  const exp = model.predict(CODES[startGrid[idx]], idx);
+  for (let i = 0; i < SQ_BYTES; i++) {
+    synthetic[idx * SQ_BYTES + i] = Math.max(0, Math.min(255, Math.round(exp[i])));
+  }
+}
+const blind = model.blindMoves(synthetic, LEARNED_FROM, cfg.squareLimit);
+if (blind.length) {
+  problems.push(`${blind.length} of the 20 opening moves would leave no square wrong:`
+    + `\n    ${blind.slice(0, 8).join(' ')}${blind.length > 8 ? ' …' : ''}`
+    + `\n    Playing one of those would look exactly like standing still, so it could`
+    + `\n    never be detected. This calibration cannot be played on — re-run`
+    + `\n    \`npm run calibrate\` on a board with no last-move highlight on it.`);
 }
 
 const fitLimit = (model.contrast * 0.1) ** 2;

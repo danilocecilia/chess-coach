@@ -102,6 +102,14 @@ async function main() {
     console.log('Include the move numbers and both move columns. Leave out any');
     console.log('evaluation bars or accuracy graphics down the right-hand edge —');
     console.log('they are solid blocks, not text, and only add shapes to sort out.\n');
+    console.log('Drag the whole list container, top to bottom — not a slice of it.');
+    console.log('The container stays put on screen while the moves scroll inside it,');
+    console.log('so a slice that holds the newest moves in a long game is blank at');
+    console.log('the start of one, when the list has two rows at the top.\n');
+    console.log('Blank space in the rectangle costs nothing: a row is found where');
+    console.log('there is ink, and the threshold is read off a fixed count of the');
+    console.log('strongest pixels rather than a share of the region, so an empty');
+    console.log('panel and a full one are measured the same way.\n');
     const picked = await ps('pick-region.ps1');
     region = { x: picked.x, y: picked.y, w: picked.w, h: picked.h };
     writeFileSync(PANEL_CONFIG, JSON.stringify({ region }, null, 2));
@@ -128,8 +136,13 @@ async function main() {
 }
 
 function report(frame, shot) {
-  const { map, floor, gap, rows } = segment(frame.pixels, frame.w, frame.h);
+  const { map, floor, gap, rows, bars } = segment(frame.pixels, frame.w, frame.h);
   console.log(`ink floor ${floor}   token gap ${gap}px`);
+  if (bars.size) {
+    const xs = [...bars].sort((a, b) => a - b);
+    console.log(`masked ${bars.size} bar column${bars.size > 1 ? 's' : ''}`
+      + ` at x${xs[0]}-${xs[xs.length - 1]} — a scrollbar or a rule, not text.`);
+  }
 
   if (!rows.length) {
     console.error(`\nNo text found. Open ${shot} — if that is not the move list,`);

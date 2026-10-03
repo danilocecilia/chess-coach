@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderReport, titleOf, sanWords } from '../src/report.js';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { renderReport, titleOf, sanWords, saveNote, loadNote } from '../src/report.js';
 import { reviewGame, reviewAll } from '../src/review.js';
 
 /*
@@ -59,6 +62,62 @@ test('the page carries its games inline and needs nothing from the network', () 
   assert.equal(data.gradeColors.Blunder, '#fa412d');
 
   assert.ok(!/(src|href)="https?:/.test(html), 'no external script, style or font');
+});
+
+test('the cross-game sentence is carried, and set apart from the computed one', () => {
+  const games = [game()];
+  const page = runPage(renderReport({
+    generated: '2026-09-24T00:00:00Z', all: reviewAll(games), games,
+    note: { note: 'Hanging pieces is still the one, and it is not moving.', games: 1, graded: 1 },
+  }));
+
+  assert.ok(page.text.includes('Hanging pieces is still the one'), 'the sentence is on the page');
+  // Its own element, because it is the one paragraph here a model wrote and the
+  // numbers beside it are measurements.
+  assert.equal(page.find('said').length, 1);
+  assert.ok(!page.text.includes('written after'), 'nothing to disclaim when it is current');
+});
+
+test('a sentence older than the games under it says so rather than being dropped', () => {
+  const games = [game()];
+  const page = runPage(renderReport({
+    generated: '2026-09-24T00:00:00Z', all: reviewAll(games), games,
+    note: { note: 'Your endgames are where it goes.', games: 7, graded: 300 },
+  }));
+
+  assert.ok(page.text.includes('Your endgames are where it goes.'));
+  assert.ok(page.text.includes('written after 7 games'), 'the span it was true of is named');
+});
+
+test('with no sentence the page is exactly what it was', () => {
+  const games = [game()];
+  const page = runPage(renderReport({
+    generated: '2026-09-24T00:00:00Z', all: reviewAll(games), games,
+  }));
+
+  assert.equal(page.find('said').length, 0);
+  // The composed paragraph is not conditional on it — that one is measured.
+  assert.ok(page.textIn('#work').includes('of win probability each time'));
+});
+
+test('a half-written or empty cached sentence is ignored, not rendered', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'coach-note-'));
+  const file = path.join(dir, 'note.json');
+  try {
+    assert.equal(loadNote(file), null, 'nothing cached yet');
+
+    saveNote(file, 'Knight forks, mostly as Black.', { games: 4, graded: 120 });
+    assert.equal(loadNote(file).note, 'Knight forks, mostly as Black.');
+    assert.equal(loadNote(file).games, 4);
+
+    writeFileSync(file, '{"note": "cut off halfw');
+    assert.equal(loadNote(file), null, 'a torn file is not a sentence');
+
+    saveNote(file, '', { games: 4, graded: 120 });
+    assert.equal(loadNote(file), null, 'and neither is an empty one');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a game title that could close the script tag cannot', () => {

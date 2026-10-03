@@ -21,7 +21,7 @@ Three parts, each doing what it is actually good at:
 | **.NET screen capture** | grabs the board region, downsamples it |
 | **Template matching (JS)** | pixels to a move |
 | **Stockfish** | the verdict |
-| **Jev / OpenRouter** | the explanation |
+| **Jev / OpenRouter** | the explanation, and the one paragraph about your record |
 
 **The engine grades; the model only narrates.** Move quality is the win-probability
 swing across the move, which Stockfish computes exactly. Language models are
@@ -299,12 +299,53 @@ node src/main.js --fen "…" start from a position other than the opening (a FEN
 npm run review             what you keep getting wrong, across every game
 npm run dashboard          that, as a page, without playing
 npm run play               play the positions you lost, until you stop losing them
+npm run hub                all of the above, on one page, without a terminal
 ```
 
 A live review dashboard opens by itself when the coach starts, and follows the
 game as you play — see [Reviewing a game](#reviewing-a-game).
 
-A small always-on-top window shows the verdict; drag it anywhere. Ctrl+C stops.
+A small always-on-top window shows the verdict; drag it anywhere. Ctrl+C stops —
+and so does typing `q`, which is the same stop the hub sends.
+
+### Without a terminal
+
+`npm run hub` serves one page at `http://127.0.0.1:7070` that starts, watches and
+stops everything above. Nothing new happens there: it spawns the same processes
+with the same arguments, so `npm start` and `npm run play` keep working exactly
+as they did, and a coach started from a terminal shows up on the page as
+**adopted** — stoppable, though with no live log, because the hub never held its
+pipes.
+
+Three things on the page are worth knowing about.
+
+**One origin.** The review used to be `:7171` and a drill `:7272`. Both are now
+served by the hub on its single port, mounted rather than reimplemented — the
+same `handle` method the standalone servers dispatch through, so there is one
+copy of every behaviour. `/api/*` and `/events` deliberately keep their root
+paths, because the client scripts ask for them absolutely and a `<base href>`
+cannot rewrite that. The reason for going to the trouble is that an installed
+web app is scoped to one origin, and a link that leaves that scope opens outside
+the app window.
+
+**Stop is a file, not a signal.** The page's Stop button writes `q` to
+`.hint-request`, which the coach already polls every 150 ms for the hint keys.
+That is not a shortcut around signals: on Windows a signal sent from another
+process never reaches Node at all, and `kill` becomes a `TerminateProcess` that
+runs no handler — losing the final PGN and stranding Stockfish, the capture
+daemon and the overlay window. A file also reaches a coach the hub did not
+start, which a pipe cannot, and that is the case that matters when the hub has
+been restarted.
+
+**Calibration and a live coach do not mix.** The Setup card refuses to calibrate
+while a coach is running, because calibration drives a picker over the same
+screen and rewrites the very files that coach has loaded.
+
+Electron was the obvious way to make this a desktop application and is ruled
+out here: Smart App Control is enforcing on this machine, the `electron.exe` npm
+ships is unsigned, and the block applies in development as much as in
+distribution. See [Why Node and not Python](#why-node-and-not-python) — it is
+the same constraint that chose Node.
 
 ### Asking the coach
 
@@ -323,7 +364,7 @@ deeper on the same question.
 > t
    .. it is aimed at your pawn on f7
 > t
-   .. Qxf7# is the idea — it is mate next move
+   .. Qxf7# (queen takes on f7, checkmate) is the idea — it is mate next move
 
 > w
    .. your pawn on f7 is attacked 2 times and defended 1
@@ -802,11 +843,17 @@ What the move log shows, and what you read in any chess book.
 Squares are file (a–h, left to right from White's side) then rank (1–8, White's
 end to Black's).
 
-**On the report page you do not have to remember any of this**: every move is
+**You do not have to remember any of this.** On the report page every move is
 underlined, and hovering one reads it out — `Nxf8` as "knight takes on f8",
 `exd8=Q+` as "the pawn on the e-file takes on d8, promoting to a queen, with
 check". It covers the moves inside the engine's lines too, which is where the
 notation is least familiar and most worth reading.
+
+The coach's `t` answer carries the same reading inline, as `Qxf7# (queen takes
+on f7, checkmate)`, because the overlay has no hover to hide one behind and that
+line is the one answer here that is pure notation. The notation stays in front
+of the words rather than being replaced by them — the point is to stop needing
+this, which only happens if you keep seeing it.
 
 It is read from the notation itself rather than looked up in the position, so it
 says *knight takes on f8* and not *which* knight or what it took. That is
@@ -858,7 +905,7 @@ Environment variables, or a `.env` file in this directory:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `JEV_API_KEY` | — | OpenRouter key. Without it you still get verdicts, just no explanations. |
+| `JEV_API_KEY` | — | OpenRouter key. Without it you still get verdicts, grades, habits and the whole review page — just no sentences. |
 | `COACH_MODEL` | `qwen/qwen3-30b-a3b-instruct-2507` | Chosen by benchmark: correct, names the better move, ~1.5s, $0.00003/move. |
 | `COACH_DEPTH` | `18` | Stockfish depth. ~1s per move; drop to 15 if it lags. |
 | `COACH_MOVE_THRESHOLD` | `6` | How much better a move must fit the pixels than "nothing changed". Raise if it sees phantom moves, lower if it misses real ones. |
@@ -873,6 +920,36 @@ Environment variables, or a `.env` file in this directory:
 Only Inaccuracy, Mistake, Blunder and Brilliant are narrated. Asking a model to
 explain a good move invites it to invent a fault, so the rest are left alone —
 which also keeps a full game well under a cent.
+
+### The second call: what your record says
+
+The model is used in exactly two places, and the other one is the paragraph at
+the top of the review page. The rest of that paragraph is a fault title, four
+numbers and a fixed line of advice — which means everyone with the same worst
+habit reads the same sentence, while your record also knows the ranking, the
+trend and how much of your play each habit touches.
+
+It runs when a game ends, never while the page is being built: `rebuild()` runs
+after every graded move and the page has to keep working with the network off,
+so the sentence is cached to `reports/note.json` and the builder only reads it.
+If the call fails you get the measured paragraph exactly as before, and if the
+cached sentence is older than the games on the page it says which span it was
+written for rather than quietly describing the wrong one.
+
+**What it is not given, and why.** The first version handed it the phase split
+and the colour split as well. Those are over every mistake together, while a
+trend belongs to one habit, and nothing in the data joins them — in four runs
+against a real 57-game record the model joined them three times anyway
+(*"positional drift is worsening, especially in the middlegame"*, which the
+record neither says nor can say), and once closed on *"increasing risk in your
+decision-making under pressure"*, which is not a measurement of anything.
+Firmer instructions did not stop it. Removing the two numbers that do not belong
+to each other did — the same move as keeping the FEN out of the move narration.
+
+It is also handed every proportion already worked out. Told only "79 moves in 34
+games" under a heading of 57, it wrote *"over a third of your games"*, and 34 of
+57 is nearly two thirds. A model does arithmetic when there is arithmetic
+available, correctly or not, so there is none left available.
 
 ## Tests
 
@@ -912,9 +989,14 @@ src/dashboard.js  serves that page on localhost, refreshed as you play
 src/play.js       which of your lost positions to replay, and when you may move on
 src/play-server.js the play session: the coach pointed at a position, not a screen
 src/play-page.js  the board you play on; it knows no chess
+src/play-deck.js  which positions a session is dealt, and what you have seen
+src/hub.js        one origin: the review, a drill and the hub on a single port
+src/hub-page.js   the page you start things from
+src/coach-control.js starts, watches and stops the coach — including one it did not start
 src/coach.js      the one place a language model is used
 src/hint.js       the coaching topics behind t / w / c
 src/audit.js      what is weak in your position, no engine needed
+src/san.js        notation read out in words, for the page and the hint line
 src/threat.js     what he is threatening, via a null move
 src/log.js        the session record: every frame, kept
 src/overlay.js    drives the overlay window

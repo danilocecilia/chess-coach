@@ -25,7 +25,11 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $W = 430
-$H = 180
+# Three lines of hint, not two. Since the threat topic reads its move out in
+# words as well as notation ("Qxe8 (queen takes on e8)"), the longest sentence
+# it can produce measures 55px wrapped at this width — a label sized for two
+# lines dropped the last one, which is the half that says what the move costs.
+$H = 200
 $PAD = 18
 
 # Figtree is the design system's face, but WinForms cannot read the woff2 the
@@ -49,6 +53,8 @@ $fontSan     = Select-Font $mono 11 ([System.Drawing.FontStyle]::Bold)
 $fontEval    = Select-Font $mono  9 ([System.Drawing.FontStyle]::Regular)
 $fontWhy     = Select-Font $sans 10 ([System.Drawing.FontStyle]::Regular)
 $fontHint    = Select-Font $sans 10 ([System.Drawing.FontStyle]::Bold)
+$fontSay     = Select-Font $sans 10 ([System.Drawing.FontStyle]::Italic)
+$fontCoachGL = Select-Font $sans 11 ([System.Drawing.FontStyle]::Bold)
 
 # What the first paint uses; Node replaces all of it on the first tick.
 $script:ink = @{
@@ -159,8 +165,40 @@ $lblHint = New-Object System.Windows.Forms.Label
 $lblHint.Font      = $fontHint
 $lblHint.ForeColor = Get-Ink 'hint'
 $lblHint.Location  = New-Object System.Drawing.Point($PAD, 128)
-$lblHint.Size      = New-Object System.Drawing.Size(($W - $PAD * 2), 36)
+$lblHint.Size      = New-Object System.Drawing.Size(($W - $PAD * 2), 56)
 $form.Controls.Add($lblHint)
+
+$lblSay = New-Object System.Windows.Forms.Label
+$lblSay.Font      = $fontSay
+$lblSay.ForeColor = Get-Ink 'why'
+$lblSay.Location  = New-Object System.Drawing.Point(($PAD + 36), 128)
+$lblSay.Size      = New-Object System.Drawing.Size(($W - $PAD * 2 - 36), 56)
+$lblSay.Visible   = $false
+$form.Controls.Add($lblSay)
+
+# Coach avatar: a small teal circle with "C", shown beside the spoken text when
+# the voice coach is narrating. Hidden during regular hints (t/w/c), since those
+# are your questions rather than the coach's initiative.
+$coachBadge = New-Object System.Windows.Forms.Panel
+$coachBadge.Size     = New-Object System.Drawing.Size(28, 28)
+$coachBadge.Location = New-Object System.Drawing.Point($PAD, 130)
+$coachBadge.BackColor = Get-Ink 'bg'
+$coachBadge.Visible  = $false
+$coachBadge.Add_Paint({
+  param($s, $e)
+  $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+  $brush = New-Object System.Drawing.SolidBrush (Get-Ink 'hint')
+  $e.Graphics.FillEllipse($brush, 0, 0, 27, 27)
+  $brush.Dispose()
+  $fmt = New-Object System.Drawing.StringFormat
+  $fmt.Alignment     = [System.Drawing.StringAlignment]::Center
+  $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+  $ink = New-Object System.Drawing.SolidBrush (Get-Ink 'onGrade')
+  $rect = New-Object System.Drawing.RectangleF 0, 0, 28, 28
+  $e.Graphics.DrawString('C', $fontCoachGL, $ink, $rect, $fmt)
+  $ink.Dispose(); $fmt.Dispose()
+})
+$form.Controls.Add($coachBadge)
 
 # Drag the window by its body, since it has no title bar.
 $script:drag = $false; $script:dragOrigin = [System.Drawing.Point]::Empty
@@ -174,9 +212,9 @@ $onMove = {
 }
 $onUp = { $script:drag = $false }
 
-# t / w / c ask the coach a question: his threat, your weaknesses, whether this
-# move matters. The letter itself is handed over, so adding a topic on the Node
-# side needs no change here.
+# t / w / c / s ask the coach a question: his threat, your weaknesses, whether
+# this move matters, and a move suggestion. The letter itself is handed over, so
+# adding a topic on the Node side only needs a key added here.
 #
 # This window is TopMost and shown with ShowDialog, so it takes the keyboard the
 # moment it appears and the terminal stops receiving keys. Rather than wrestling
@@ -187,6 +225,9 @@ $coachKeys = @{
   [System.Windows.Forms.Keys]::T = 't'
   [System.Windows.Forms.Keys]::W = 'w'
   [System.Windows.Forms.Keys]::C = 'c'
+  [System.Windows.Forms.Keys]::S = 's'
+  [System.Windows.Forms.Keys]::A = 'a'
+  [System.Windows.Forms.Keys]::M = 'm'
 }
 $form.KeyPreview = $true
 $form.Add_KeyDown({
@@ -197,7 +238,7 @@ $form.Add_KeyDown({
 # Every control, or the strip it covers stops being draggable. The rule is one
 # pixel high and the badge is a hole in the middle of the grab area, so both
 # matter more than their size suggests.
-foreach ($c in @($form, $badge, $lblVerdict, $lblSan, $lblEval, $lblWhy, $rule, $lblHint)) {
+foreach ($c in @($form, $badge, $lblVerdict, $lblSan, $lblEval, $lblWhy, $rule, $lblHint, $lblSay, $coachBadge)) {
   $c.Add_MouseDown($onDown); $c.Add_MouseMove($onMove); $c.Add_MouseUp($onUp)
 }
 
@@ -206,11 +247,13 @@ function Set-Ink($s) {
   foreach ($k in @('bg', 'verdict', 'eval', 'why', 'hint', 'onGrade')) {
     if ($s.ink.$k) { $script:ink[$k] = $s.ink.$k }
   }
-  $form.BackColor  = Get-Ink 'bg'
-  $badge.BackColor = Get-Ink 'bg'
-  $lblEval.ForeColor = Get-Ink 'eval'
-  $lblWhy.ForeColor  = Get-Ink 'why'
-  $lblHint.ForeColor = Get-Ink 'hint'
+  $form.BackColor       = Get-Ink 'bg'
+  $badge.BackColor      = Get-Ink 'bg'
+  $coachBadge.BackColor = Get-Ink 'bg'
+  $lblEval.ForeColor    = Get-Ink 'eval'
+  $lblWhy.ForeColor     = Get-Ink 'why'
+  $lblHint.ForeColor    = Get-Ink 'hint'
+  $lblSay.ForeColor     = Get-Ink 'why'
 }
 
 function Set-State($s) {
@@ -240,8 +283,31 @@ function Set-State($s) {
   $lblSan.Text  = $s.san
   $lblEval.Text = $s.eval
   $lblWhy.Text  = $s.why
-  $lblHint.Text = $s.hint
-  $rule.Visible = [bool]$s.hint
+
+  # Coach speech and regular hints share the same visual area. Coach speech
+  # (verdicts, explanations) shows the avatar and quotes; a regular hint (t/w/c)
+  # takes the area back without the avatar. `say` and `hint` are kept mutually
+  # exclusive by the Node side, so at most one is non-empty.
+  if ($s.say) {
+    $coachBadge.Visible = $true
+    $coachBadge.Invalidate()
+    $lblSay.Text       = "$([char]0x201C)$($s.say)$([char]0x201D)"
+    $lblSay.Visible    = $true
+    $lblHint.Visible   = $false
+    $rule.Visible      = $true
+  } elseif ($s.hint) {
+    $coachBadge.Visible = $false
+    $lblHint.Text      = $s.hint
+    $lblHint.Visible   = $true
+    $lblSay.Visible    = $false
+    $rule.Visible      = $true
+  } else {
+    $coachBadge.Visible = $false
+    $lblHint.Text      = ''
+    $lblHint.Visible   = $true
+    $lblSay.Visible    = $false
+    $rule.Visible      = $false
+  }
 }
 
 $script:lastWrite = [DateTime]::MinValue
@@ -252,14 +318,13 @@ $timer.Add_Tick({
     if (-not (Test-Path $StateFile)) { return }
     $w = (Get-Item $StateFile).LastWriteTimeUtc
     if ($w -le $script:lastWrite) { return }
-    $script:lastWrite = $w
     # -Encoding UTF8 is not optional: Node writes UTF-8 without a BOM, and
     # Windows PowerShell 5.1 falls back to the ANSI codepage when there is no
     # BOM, which turns the label glyphs into mojibake (star -> "a~...").
+    $script:lastWrite = $w
     Set-State (Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json)
   } catch {
-    # A torn read or transient lock is not worth killing the overlay over;
-    # the next tick will pick up the same file.
+    [Console]::Error.WriteLine("overlay-tick: $_")
   }
 })
 $timer.Start()

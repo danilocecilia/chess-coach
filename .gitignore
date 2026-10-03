@@ -16,6 +16,9 @@ reports/*
 board.json
 panel.json
 .overlay-state.json
+.hint-request
+.coach.pid
+.audio/
 
 # Environment variables
 .env

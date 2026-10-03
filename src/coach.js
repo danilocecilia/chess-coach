@@ -124,3 +124,117 @@ export function explain(grade, opts = {}) {
   return ask(SYSTEM, buildPrompt(grade), opts);
 }
 
+/* ------------------------------------------------------ across games ------ */
+
+/**
+ * The second call, and the only other one: what your record says about you.
+ *
+ * ## Why this one is worth a model and the hint sentences are not
+ *
+ * The rule above — the model narrates, it never judges — is what decides it.
+ * `audit.js` and `hint.js` hand you a fact about the board in front of you, and
+ * a model could only make it vaguer. The page's "what to work on" paragraph is
+ * the opposite case: the facts are all computed, there are a lot of them, and
+ * what is missing is a sentence that puts them together. Today that paragraph is
+ * a title, four numbers and a fixed string from FAULTS — which means every
+ * player with the same worst habit reads exactly the same sentence, while the
+ * page already knows that yours is improving, happens mostly in the endgame, and
+ * happens twice as often with Black.
+ *
+ * ## The same discipline, for the same reason
+ *
+ * No FEN, no move, no position — the inputs are aggregates the page itself
+ * computed, and the model's whole job is to say which of them are the story.
+ * It is told not to do arithmetic for the same reason it is not shown a board:
+ * the numbers on the page are measurements, and a model that recomputes them
+ * will eventually print one that disagrees with the chart beside it.
+ *
+ * ## Why it is not called from the page builder
+ *
+ * `rebuild()` runs on the grading queue after every move you play, and it must
+ * keep working with the network off — the report is a file you double-click.
+ * So this is called when a game ends, the sentence is cached to disk, and the
+ * page builder only ever reads it. A failure leaves the composed paragraph
+ * exactly as it is today.
+ */
+/*
+ * ## Why the phase and colour figures are not in here
+ *
+ * They were, and benchmarking against a real 57-game record is what took them
+ * out. The page's phase split and colour split are over *every* mistake
+ * together; the trend is per habit. Nothing in the data joins the two — and in
+ * four runs the model joined them three times anyway: "positional drift is
+ * worsening, especially in the middlegame", which the record does not say and
+ * cannot say. One run also closed on "increasing risk in your decision-making
+ * under pressure", which is not a measurement of anything.
+ *
+ * Instructions not to do it did not stop it, and that is the useful finding: a
+ * fact that can be mis-joined eventually will be. The fix is not a firmer rule,
+ * it is not handing over the two numbers that do not belong to each other — the
+ * same move as dropping the FEN from `explain`. Everything left below is about
+ * one habit and is true of that habit alone.
+ *
+ * A per-habit phase split would be a real fact and is welcome here if it is ever
+ * computed. It cannot be derived from `f.moves`: that is the worst eight by
+ * cost, so counting phases in it would describe the sample, not the habit.
+ */
+const HABITS_SYSTEM = [
+  'You are a chess coach summarising what a player keeps doing wrong, from their own record.',
+  'Every number you need is given, worked out. Every percentage or proportion you write must',
+  'appear word for word in the facts — never work out a share, a fraction or a ratio yourself,',
+  'and do not restate every figure.',
+  'Never mention a habit that is not in the facts, and never mention where on the board,',
+  'in which phase, or with which colour something happened — you have not been told.',
+  'The facts say nothing about which games you won or lost, so never refer to either.',
+  'Do not speculate about causes, mindset or pressure, do not give chess advice,',
+  'and do not name any move. Stop once you have stated what the facts show.',
+  'Reply with at most 3 sentences, 50 words total, addressed to "you".',
+  'No preamble, no headings, no markdown, no bullet points.',
+].join(' ');
+
+/**
+ * One fault, as the lines the prompt is built from.
+ *
+ * Every proportion is worked out here rather than left to be derived. Told only
+ * "79 moves in 34 games" against a headline of 57, the model wrote "over a third
+ * of your games" — 34 of 57 is nearly two thirds — and, on another run, invented
+ * "your losing games", a category this record does not have. It computes when
+ * there is something to compute, accurately or not, so there is nothing left to.
+ */
+function habitLines(f, title, lostAll, games) {
+  const share = lostAll ? Math.round((f.cost / lostAll) * 100) : 0;
+  const each = f.count ? (f.cost / f.count).toFixed(1) : '0';
+  const inGames = games ? ` (${Math.round((f.games / games) * 100)}% of your games)` : '';
+  const out = [`- ${title}: ${f.count} moves, in ${f.games} of your ${games} games${inGames},`
+    + ` ${share}% of everything your mistakes cost, about ${each}% win probability each time.`];
+
+  // Only a decided trend is worth a line. `unknown` carries a reason rather
+  // than a direction ("only 2 games with this so far"), and handing that to a
+  // model invites it to report the absence of evidence as a finding.
+  if (f.trend && f.trend.verdict !== 'unknown') out.push(`  trend: ${f.trend.verdict}`);
+  if (f.repeatedGames > 1) out.push(`  happened twice or more in ${f.repeatedGames} of those games`);
+  return out.join('\n');
+}
+
+/**
+ * @param {object} all        from `reviewAll`
+ * @param {object} titles     fault kind -> its FAULTS title, so this file needs
+ *                            no opinion about what a fault is called
+ */
+export function summariseHabits(all, titles, opts = {}) {
+  if (!all?.games || !all.faults?.length) return null;
+
+  const lostAll = all.faults.reduce((s, f) => s + f.cost, 0);
+  const top = all.faults.slice(0, 3);
+
+  const facts = [
+    `${all.games} games, ${all.graded} of your moves graded`
+      + (all.accuracy == null ? '' : `, accuracy ${all.accuracy.toFixed(1)}%`),
+    '',
+    'Your habits, worst first. Every figure on a line belongs to that habit alone:',
+    ...top.map((f) => habitLines(f, titles[f.kind] ?? f.kind, lostAll, all.games)),
+  ].join('\n');
+
+  return ask(HABITS_SYSTEM, facts, opts);
+}
+

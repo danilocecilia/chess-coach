@@ -43,9 +43,13 @@ import { FAULTS, reviewAll } from './review.js';
 import { LOG_DIR, ROOT } from './config.js';
 import { FONTS, SANS, MONO } from './fonts.js';
 import { OVERLAY_INK } from './overlay.js';
+import { sanWords } from './san.js';
 
 /** Where the page is written. One file, so a bookmark keeps working. */
 export const REPORT_FILE = path.join(ROOT, 'reports', 'index.html');
+
+/** Where the model's cross-game sentence is cached. See {@link saveNote}. */
+export const NOTE_FILE = path.join(ROOT, 'reports', 'note.json');
 
 /**
  * The ink, in both themes, from the Chess Coach design system.
@@ -130,60 +134,14 @@ export const FIXED = {
 export const MARK = { played: '#fa412d', best: '#81b64c' };
 
 /**
- * A move in notation, read out in words: `Nxf8` -> "knight takes on f8".
+ * The notation reader, re-exported.
  *
- * ## Why it is structural, and not looked up in the position
- *
- * With the position in hand this could say far more — *which* knight, and what
- * it took. It deliberately does not. Half the moves on this page are inside
- * variations the engine returned, where no position was ever stored, and a
- * reading that works on the move you played but not on the three that answer it
- * teaches the notation in exactly the half of the cases where it is already
- * obvious. Structure is also the thing being learned: that the capital letter is
- * the piece, that `x` is a capture, that the square comes last.
- *
- * ## Why it lives here and is shipped as source
- *
- * It is embedded into the page by `String(sanWords)` rather than written inside
- * the page script, so it can be exported and unit-tested as an ordinary
- * function. Everything it needs is inside it — nothing is closed over, because
- * on the other side of that trip there is nothing to close over.
- *
- * Returns null for anything that is not a move, which is what keeps this off
- * free text: `your pawn on f5` contains a square, not a move, and a tooltip
- * reading "pawn to f5" over it would be teaching the notation wrongly.
+ * It moved to `san.js` when the coach's hint line started reading moves out too
+ * — see there for what it does and why it is shipped into this page as source.
+ * It is still exported from here because this page is its oldest caller and the
+ * tests ask this module for it.
  */
-export function sanWords(san) {
-  const NAME = { K: 'king', Q: 'queen', R: 'rook', B: 'bishop', N: 'knight' };
-  const s = String(san == null ? '' : san).trim().replace(/[!?]+$/, '');
-  const end = (t) => (/#$/.test(s) ? t + ', checkmate' : /\+$/.test(s) ? t + ', with check' : t);
-
-  if (/^(?:O-O-O|0-0-0)[+#]?$/.test(s)) return end('castles queenside');
-  if (/^(?:O-O|0-0)[+#]?$/.test(s)) return end('castles kingside');
-
-  const m = /^([KQRBN])?([a-h])?([1-8])?(x)?([a-h][1-8])(?:=([QRBN]))?[+#]?$/.exec(s);
-  if (!m) return null;
-
-  /*
-   * A pawn move never says where it came from except to name the file it
-   * captures from: `d5` and `exd5` are moves, `d4d5` is not — that is UCI, and
-   * reading it as "the pawn on d4 to d5" would put a confident sentence under
-   * something this page never writes. Refusing leaves it as plain text.
-   */
-  if (!m[1] && (m[3] || (m[2] && !m[4]))) return null;
-  const piece = m[1] ? NAME[m[1]] : 'pawn';
-
-  // Where it came from, when the notation had to say — two pieces of the same
-  // kind could have gone there, which is the whole reason the letter is there.
-  let who = piece;
-  if (m[2] && m[3]) who = 'the ' + piece + ' on ' + m[2] + m[3];
-  else if (m[2]) who = 'the ' + piece + ' on the ' + m[2] + '-file';
-  else if (m[3]) who = 'the ' + piece + ' on rank ' + m[3];
-
-  const verb = m[4] ? ' takes on ' : ' to ';
-  const promo = m[6] ? ', promoting to a ' + NAME[m[6]] : '';
-  return end(who + verb + m[5] + promo);
-}
+export { sanWords };
 
 /** JSON safe to sit inside a <script> tag. */
 function embed(data) {
@@ -290,6 +248,15 @@ ${vars('light')}
     background: var(--surface); border: 1px solid var(--border);
   }
   .work b { font-weight: 700; }
+  /* The one paragraph on this page a model wrote, set apart from the measured
+     sentence above it. Every number in the block above is computed; this reads
+     them back. The rule on the left is the whole distinction, so it stays even
+     when the two sit in the same card. */
+  .said {
+    margin: 14px 0 0; padding-left: 12px; border-left: 2px solid var(--border);
+    color: var(--secondary);
+  }
+  .said .when { color: var(--muted); }
   .tag {
     display: inline-block; font-size: 12px; line-height: 16px; font-weight: 800;
     letter-spacing: 0.06em; text-transform: uppercase;
@@ -1641,6 +1608,26 @@ function render() {
       + share(top).toFixed(0) + '% of everything your mistakes have cost, about '
       + each(top).toFixed(1) + '% of win probability each time. '
       + R.faults[top.kind].work + '.'));
+
+    /*
+     * And what that looks like across the games, in a sentence written for your
+     * record rather than for the fault. Everything above is the same for every
+     * player with the same worst habit; this is the part that is only yours.
+     *
+     * Cached, so it can be older than the games on the page — which is not the
+     * same as being wrong, since it was true of the games it was written for.
+     * It says so instead of being dropped.
+     */
+    if (R.note && R.note.note) {
+      const said = el('p', 'said');
+      said.appendChild(document.createTextNode(R.note.note));
+      if (R.note.games !== all.games) {
+        said.appendChild(el('span', 'when',
+          ' — written after ' + R.note.games
+          + (R.note.games === 1 ? ' game' : ' games') + '.'));
+      }
+      w.appendChild(said);
+    }
   }
 
   /* --- find the move --- */
@@ -1965,6 +1952,37 @@ export function saveReview(dir, games) {
   } catch { return false; /* disk, or a log dir that is gone */ }
 }
 
+/**
+ * The cross-game sentence, kept beside the page rather than inside it.
+ *
+ * It is the one thing on this page a model wrote, and it is cached for two
+ * reasons. `rebuild()` runs after every graded move, which is no place for a
+ * network call; and the page has to keep building with the network off, which
+ * is the property that makes it a file you can double-click.
+ *
+ * `games` and `graded` are stored with it so the page can tell whether the
+ * sentence still describes the evidence under it. Out of date is not the same
+ * as wrong — it was true of the games it was written for — so the page says so
+ * rather than hiding it.
+ */
+export function saveNote(file, note, { games, graded }) {
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({
+      version: 1, note, games, graded, generated: new Date().toISOString(),
+    }, null, 1));
+    return true;
+  } catch { return false; /* a sentence is never worth failing a session for */ }
+}
+
+export function loadNote(file) {
+  if (!existsSync(file)) return null;
+  try {
+    const d = JSON.parse(readFileSync(file, 'utf8'));
+    return typeof d?.note === 'string' && d.note ? d : null;
+  } catch { return null; }
+}
+
 export function loadReview(dir) {
   const file = path.join(dir, 'review.json');
   if (!existsSync(file)) return null;
@@ -1991,20 +2009,36 @@ export function titleOf(session, n, games) {
  * whole point of the page, and it changes with every game played, so there is
  * no version of this that only touches the newest row.
  */
-export function rebuild({ logDir = LOG_DIR, out = REPORT_FILE } = {}) {
+/**
+ * Every reviewed game on disk, oldest first.
+ *
+ * Shared so that anything describing the whole record describes the same record
+ * the page draws — a summary written from one session's reviews while the page
+ * ranks across twelve would be a sentence about a different player.
+ */
+export function allGames(logDir = LOG_DIR) {
   const games = [];
-  if (existsSync(logDir)) {
-    for (const session of readdirSync(logDir).sort()) {
-      for (const g of loadReview(path.join(logDir, session)) ?? []) {
-        // A game with nothing graded is a session that never got going. It has
-        // no accuracy, no grades and no faults, so it would draw one empty row
-        // and count towards a total it contributes nothing to.
-        if (g.graded > 0) games.push(g);
-      }
+  if (!existsSync(logDir)) return games;
+  for (const session of readdirSync(logDir).sort()) {
+    for (const g of loadReview(path.join(logDir, session)) ?? []) {
+      // A game with nothing graded is a session that never got going. It has
+      // no accuracy, no grades and no faults, so it would draw one empty row
+      // and count towards a total it contributes nothing to.
+      if (g.graded > 0) games.push(g);
     }
   }
+  return games;
+}
+
+export function rebuild({ logDir = LOG_DIR, out = REPORT_FILE, note = NOTE_FILE } = {}) {
+  const games = allGames(logDir);
   // Newest first: the game you just played is the one you came to look at.
   games.reverse();
-  writeReport(out, { generated: new Date().toISOString(), all: reviewAll(games), games });
+  writeReport(out, {
+    generated: new Date().toISOString(), all: reviewAll(games), games,
+    // Read, never written, from here: this path has no network and must not
+    // grow one. See saveNote.
+    note: loadNote(note),
+  });
   return { file: out, games: games.length };
 }

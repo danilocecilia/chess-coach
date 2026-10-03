@@ -34,7 +34,10 @@ import { LOG_DIR, STOCKFISH, DEPTH } from '../src/config.js';
 import { Engine } from '../src/engine.js';
 import { gradeMove, toUci } from '../src/grade.js';
 import { reviewGame, reviewAll, summarise, gamesFromLog, FAULTS } from '../src/review.js';
-import { saveReview, loadReview, rebuild, titleOf } from '../src/report.js';
+import {
+  saveReview, loadReview, rebuild, titleOf, saveNote, allGames, NOTE_FILE,
+} from '../src/report.js';
+import { summariseHabits } from '../src/coach.js';
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(name);
@@ -199,6 +202,25 @@ function open(file) {
   } catch { /* no browser is not a failure worth stopping for */ }
 }
 
+/**
+ * Rewrite the page's cross-game sentence from everything now on disk.
+ *
+ * Here rather than inside `rebuild()` because the page builder must stay
+ * offline: `reports/index.html` is a file you double-click, and it is rebuilt
+ * after every graded move while you play. This runs once, at the end of a
+ * command, and its failure is silent — the page keeps the sentence it had.
+ */
+async function refreshNote() {
+  try {
+    const all = reviewAll(allGames());
+    if (!all.games) return;
+    const titles = Object.fromEntries(
+      Object.entries(FAULTS).map(([k, v]) => [k, v.title]));
+    const note = await summariseHabits(all, titles);
+    if (note) saveNote(NOTE_FILE, note, { games: all.games, graded: all.graded });
+  } catch { /* the page is worth more than the sentence on it */ }
+}
+
 async function main() {
   let dirs;
   if (opts.pgn) dirs = [];
@@ -260,6 +282,10 @@ async function main() {
   }
 
   /* --- the page --- */
+  // Before the build, and awaited: this is a command you ran and waited for, so
+  // the page it prints a path to should be the finished one. The live coach
+  // does the opposite for the same reason — there, nothing is waiting.
+  await refreshNote();
   const built = rebuild();
   const played = reviewed.filter((g) => g.graded > 0);
 

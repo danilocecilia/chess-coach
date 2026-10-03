@@ -3,12 +3,13 @@
  *
  *   node src/main.js            grade only your moves
  *   node src/main.js --all      grade both sides
+ *   node src/main.js --live     start from whatever position is on screen now
  *   node src/main.js --fen "…"  start from a position other than the opening,
  *                               given as a FEN (Forsyth-Edwards Notation — a
  *                               whole position on one line; README explains it)
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, rmSync } from 'node:fs';
 import readline from 'node:readline';
 import path from 'node:path';
 import { Chess } from 'chess.js';
@@ -20,15 +21,17 @@ import { MoveWatcher, Ladder, freshStart, frameDiff, QUIET, OCCLUDE_MAX } from '
 import { openLog, fileHash } from './log.js';
 import { Engine } from './engine.js';
 import { gradeMove } from './grade.js';
-import { explain, shouldExplain } from './coach.js';
-import { reviewGame, summarise } from './review.js';
-import { saveReview, rebuild, titleOf } from './report.js';
+import { explain, shouldExplain, summariseHabits } from './coach.js';
+import { reviewGame, summarise, reviewAll, FAULTS } from './review.js';
+import { saveReview, rebuild, titleOf, saveNote, allGames, NOTE_FILE } from './report.js';
 import { Dashboard } from './dashboard.js';
 import { TOPICS, KEYS } from './hint.js';
 import { findThreat } from './threat.js';
 import { Overlay } from './overlay.js';
+import { Audio } from './audio.js';
 import { formatScore } from './verdict.js';
-import { STOCKFISH, DEPTH, BOARD_CONFIG, TEMPLATE_DIR } from './config.js';
+import { sanWords } from './san.js';
+import { STOCKFISH, DEPTH, BOARD_CONFIG, TEMPLATE_DIR, PID_FILE } from './config.js';
 
 const POLL_MS = 150;
 
@@ -106,11 +109,17 @@ function parseArgs(argv) {
   return {
     all: argv.includes('--all'),
     fen: argv.includes('--fen') ? argv[argv.indexOf('--fen') + 1] : undefined,
+    live: argv.includes('--live'),
   };
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.live && args.fen) {
+    console.error('--live reads the board directly; --fen is not needed with it.');
+    process.exit(1);
+  }
 
   if (!existsSync(BOARD_CONFIG)) {
     console.error('Not calibrated yet. Run:  npm run calibrate');
@@ -179,9 +188,9 @@ async function main() {
   };
 
   const frame0 = await settledFrame();
-  let facing0 = null, stale0 = null;
+  let facing0 = null, stale0 = null, det0 = null;
   if (frame0) {
-    const det0 = model.detectMove(frame0, chess, { squareLimit, softLimit });
+    det0 = model.detectMove(frame0, chess, { squareLimit, softLimit });
     stale0 = model.themeDrift(frame0);
     if (det0.occluded <= OCCLUDE_MAX) {
       const f = facingOf(det0);
@@ -194,8 +203,25 @@ async function main() {
     }
   }
 
+  if (args.live) {
+    if (!frame0 || !det0 || det0.occluded > OCCLUDE_MAX) {
+      console.error('Cannot read the board — make sure it is fully visible and not covered.');
+      await cap.quit(); await log.close();
+      process.exit(1);
+    }
+    const read = model.readBoard(det0.tint, { squareLimit, mask: det0.mask });
+    if (!read) {
+      console.error('Cannot read the board — the pieces are ambiguous at this resolution.');
+      console.error('Make sure the position is settled (no animation, no dialog over the board).');
+      await cap.quit(); await log.close();
+      process.exit(1);
+    }
+    chess.load(read.fen);
+  }
+
   const engine = await new Engine(STOCKFISH, { threads: 4 }).start();
   const overlay = new Overlay({ x: cfg.region.x, y: cfg.region.y + cfg.region.h + 12 }).start();
+  const audio = new Audio();
 
   /*
    * The dashboard, served for as long as the coach is running.
@@ -225,6 +251,11 @@ async function main() {
     console.log(`        (read off the board — calibration had you as the other colour)`);
   } else if (!facing0) {
     console.log(`        (could not read the board to confirm this — from calibration)`);
+  }
+  if (args.live) {
+    const toMove = chess.fen().split(' ')[1] === 'w' ? 'White' : 'Black';
+    console.log(`board:  read from screen — ${toMove} to move`);
+    console.log(`        ${chess.fen()}`);
   }
 
   /*
@@ -258,7 +289,7 @@ async function main() {
    * the same order.
    */
   const refuse = async () => {
-    overlay.quit();
+    await overlay.quit();
     await engine.quit();
     await cap.quit();
     dash.stop();
@@ -325,14 +356,36 @@ async function main() {
   console.log('Coach:  t  what is he threatening');
   console.log('        w  what is weak in your position');
   console.log('        c  does this move matter');
+  console.log('        s  suggest a move (piece first, then the move)');
+  console.log('        a  show the best move directly');
+  console.log('        m  toggle voice coaching on/off');
   console.log('        press on the overlay window, or type here + Enter.');
-  console.log('        press again for more on the same question. None name your move.');
+  console.log('        press again for more on the same question.');
+  if (audio.enabled) console.log(`voice:  ${audio.voice} — COACH_AUDIO=0 to disable, COACH_VOICE to change`);
   if (log.enabled) console.log(`log:    this session is being recorded to ${log.dir}`);
   if (dash.url) console.log(`review: ${dash.url} — open it once; it updates as you play`);
   else if (process.env.COACH_DASHBOARD !== '0') {
     console.log('review: the dashboard could not take a port; reviews still go to reports/');
   }
   console.log('Ctrl+C to stop.\n');
+
+  /*
+   * From here there is a coach worth stopping, so say so on disk.
+   *
+   * After the banner on purpose: everything above this can still refuse to start
+   * (inverted templates, a drifted theme), and those paths tear down through
+   * `refuse`, which runs before this file exists and so has nothing to clean up.
+   *
+   * A coach that cannot write a pidfile is still a perfectly good coach, so this
+   * never throws — it only costs the hub its ability to adopt this session.
+   */
+  try {
+    writeFileSync(PID_FILE, JSON.stringify({
+      pid: process.pid,
+      started: new Date().toISOString(),
+      argv: process.argv.slice(2),
+    }, null, 1));
+  } catch { /* not worth a word; the coach runs either way */ }
 
   let stopping = false;
   // Declared up here so Ctrl+C during startup — before the reader exists — does
@@ -400,6 +453,35 @@ async function main() {
     }
   };
 
+  /**
+   * Refresh the model's cross-game sentence, in the background.
+   *
+   * A game is the right cadence: this reads a whole record, and a record does
+   * not change meaningfully inside one game. Deliberately not awaited and
+   * deliberately not on the grading queue — nothing waits on it, and the page
+   * it belongs to is already on screen with the sentence from last time.
+   *
+   * It publishes when it lands, so an open dashboard picks it up on the same
+   * path every other change arrives by.
+   */
+  const refreshNote = () => {
+    let all = null;
+    // From disk, not from `snapshot()`: the page ranks across every session,
+    // and a sentence written from this one alone would describe a record the
+    // reader is not looking at. `publish()` has just written this session's
+    // games out, so disk is current.
+    try { all = reviewAll(allGames()); } catch { return; }
+    if (!all?.games) return;
+    summariseHabits(all, Object.fromEntries(
+      Object.entries(FAULTS).map(([k, v]) => [k, v.title])))
+      .then((note) => {
+        if (!note) return;
+        saveNote(NOTE_FILE, note, { games: all.games, graded: all.graded });
+        publish();
+      })
+      .catch((e) => console.error('summary failed:', e.message));
+  };
+
   /** A game has ended: keep its review, and start the next one clean. */
   const finishGame = (n) => {
     if (!graded.length) return null;
@@ -414,6 +496,7 @@ async function main() {
       return null;
     }
     publish();
+    refreshNote();
     return r;
   };
 
@@ -434,7 +517,15 @@ async function main() {
     if (stopping) return;
     stopping = true;
     keys?.close();
-    overlay.quit();
+    audio.stop();
+    /*
+     * Awaited. The overlay closes itself when it sees `quit` in the state file,
+     * and is killed if it does not, but that backstop sits behind a timer — and
+     * an unawaited timer loses to the `process.exit(0)` below whenever the
+     * teardown under it happens to be quick, which leaves an always-on-top
+     * window with nothing behind it. See Overlay#quit.
+     */
+    await overlay.quit();
     await engine.quit();
     await cap.quit();
     // Last, and awaited: the frames still sitting in the deflate buffer are
@@ -446,9 +537,19 @@ async function main() {
     // finished game pushed to it before the server goes away.
     dash.stop();
     await log.close();
+    // Last of all, so that something watching this file learns "gone" only once
+    // the PGN and the review are actually on disk, not merely promised.
+    try { rmSync(PID_FILE, { force: true }); } catch { /* nothing to remove */ }
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
+  /*
+   * SIGTERM is dead code on Windows, where a signal sent by another process does
+   * not reach Node at all (the same finding `tools/play.mjs` records). It is here
+   * so the teardown is reachable by the usual means everywhere else — this file
+   * is Windows-only today because of what it watches, not because of this.
+   */
+  process.on('SIGTERM', shutdown);
 
   const watcher = new MoveWatcher({
     floor: cfg.floor ?? null, allow: cfg.allow ?? 0, threshold: MOVE_THRESHOLD,
@@ -624,13 +725,14 @@ async function main() {
 
     const n = coach.step[key] ?? 0;
     if (n >= steps.length) {
-      return console.log(`      (that is all on ${topic.label} — it will not name your move)`);
+      return console.log(`      (that is all on ${topic.label})`);
     }
     coach.step[key] = n + 1;
     coach.taken = true;
     log.event('ask', { key, topic: topic.label, step: n, text: steps[n], fen: coach.fen });
     console.log(`      .. ${steps[n]}`);
     overlay.hint(steps[n]);
+    audio.speak(steps[n], { priority: 'hint' });
   };
 
   const askKey = (key) => ask(key).catch((e) => console.error('coach failed:', e.message));
@@ -641,7 +743,13 @@ async function main() {
   keys = readline.createInterface({ input: process.stdin, terminal: false });
   keys.on('line', (line) => {
     const key = line.trim().toLowerCase()[0];
-    if (KEYS.includes(key)) askKey(key);
+    // Typed `q` stops it, the same verb the hub sends through CONTROL_FILE.
+    if (key === 'q') return void shutdown();
+    if (key === 'm') {
+      const msg = audio.toggleMute() ? 'voice muted' : 'voice on';
+      console.log(`      ${msg}`);
+      overlay.hint(msg);
+    } else if (KEYS.includes(key)) askKey(key);
   });
 
   /**
@@ -719,12 +827,44 @@ async function main() {
         + `  (-${g.drop.toFixed(1)}%)`);
       overlay.show(g);
 
+      /*
+       * Narration is started here and deliberately not awaited.
+       *
+       * This queue is the Stockfish mutex and nothing else. A held `await` on a
+       * network call turns it into something it was never meant to be: with the
+       * 12s timeout in coach.js, a slow or unreachable model would park the
+       * queue for twelve seconds, and what queues behind it is the pre-analysis
+       * of your next turn (and a `t` search, if you ask for one). The visible
+       * symptom would be the coach answering "still thinking" on a board that
+       * has been quiet for ten seconds — a sentence nobody is waiting for
+       * holding up the answers someone is.
+       *
+       * Nothing downstream needs the sentence: the grade is already shown, the
+       * row is already logged and published. `addExplanation` carries the grade
+       * it belongs to, so a late sentence lands on its own move or not at all —
+       * that guard was written for this and is now the thing doing the work.
+       */
       if (shouldExplain(g.label)) {
-        const why = await explain(g);
-        if (why) {
-          console.log(`      ${why}`);
-          overlay.addExplanation(why, g);
-        }
+        // Speak the verdict now, so the player hears something even without
+        // a JEV key. If the LLM explanation lands later it will interrupt
+        // this (same or higher priority), replacing a bare verdict with a
+        // sentence that says why.
+        const pri = g.label.name === 'Blunder' ? 'blunder' : 'verdict';
+        const move = sanWords(g.san) ?? g.san;
+        const verdict = `${g.label.name}. ${move} costs ${Math.round(g.drop)} percent.`;
+        audio.speak(verdict, { priority: pri });
+        overlay.say(verdict);
+        explain(g)
+          .then((why) => {
+            if (!why) return;
+            // Named, because the sentence no longer necessarily follows its own
+            // move log line — a later grade can print while this is in flight.
+            console.log(`      ${g.san}: ${why}`);
+            overlay.addExplanation(why, g);
+            audio.speak(why, { priority: pri });
+            overlay.say(why);
+          })
+          .catch((e) => console.error('coach failed:', e.message));
       }
     });
   };
@@ -931,6 +1071,96 @@ async function main() {
           need: watcher.confidence, start: probe,
         });
       }
+
+      /*
+       * The board is not the exact opening position, but it might be a new game
+       * that has already moved on by a ply or two — White pre-moved, or a bot
+       * replied instantly, and by the time the coach looked the opening was gone.
+       *
+       * Gated tightly so it never fires inside the game it is tracking:
+       *   - misfits ≤ 4: the board is at most two moves from the start
+       *   - history ≥ 10 plies: the tracked game is deep enough that a near-start
+       *     board cannot be confused with the position we are following
+       *   - no occlusion: every square was readable
+       *   - once per episode: readBoard is not free, and retrying every frame
+       *     while the answer has not changed is pure waste
+       */
+      if (verdict.reason === 'misfits' && !nearMiss
+          && chess.history().length >= 10 && (det.occluded ?? 0) === 0) {
+        const nearSame = probe?.same?.misfits > 0 && probe.same.misfits <= 4;
+        const nearTurned = probe?.turned?.misfits > 0 && probe.turned.misfits <= 4;
+        if (nearSame || nearTurned) {
+          nearMiss = true;
+          const turned = !nearSame && nearTurned;
+          const readFlipped = turned ? !model.flipped : model.flipped;
+          const savedFlipped = model.flipped;
+          model.flipped = readFlipped;
+          const read = model.readBoard(det.tint, { squareLimit, mask: det.mask });
+          model.flipped = savedFlipped;
+
+          if (read) {
+            const pieces = read.fen.split(' ')[0].replace(/[0-9/]/g, '').length;
+            if (pieces >= 30) {
+              // A board with ≥ 30 men that is 1–2 moves from the start while we
+              // are deep into a different game: this is a new game, already under
+              // way. Accept it by the same path as the exact-match case, but load
+              // the read position instead of resetting to move 1.
+              const was = chess.fen();
+              const plies = chess.history().length;
+              const saved = log.pgn(chess.pgn(), games);
+              const review = finishGame(games);
+              games += 1;
+
+              if (turned) {
+                model.flipped = readFlipped;
+                playerColor = model.flipped ? 'b' : 'w';
+              }
+              const facing = facingOf(det);
+              const turnedBy = facing.flipped != null
+                && facing.margin >= ORIENTATION_MARGIN
+                && facing.flipped !== model.flipped;
+              if (turnedBy) {
+                model.flipped = facing.flipped;
+                playerColor = model.flipped ? 'b' : 'w';
+              }
+
+              chess.load(read.fen);
+              lastMove = null;
+              Object.assign(coach, {
+                fen: null, analysis: null, threat: null, step: {}, taken: false,
+              });
+              if (chess.turn() === playerColor) preAnalyse(chess.fen());
+              watcher.reset();
+              if (turned) watcher.relearnFloor();
+
+              log.event('newgame', {
+                ok: true, game: games, turned, flipped: model.flipped,
+                playerColor, nearStart: true, readFen: read.fen,
+                misfits: nearSame ? probe.same.misfits : probe.turned.misfits,
+                was, plies, pgn: saved,
+              });
+              const name = playerColor === 'w' ? 'White' : 'Black';
+              const toMove = read.fen.split(' ')[1] === 'w' ? 'White' : 'Black';
+              console.log(`\na new game — the board is near the opening position`
+                + ` (${toMove} to move), and you are ${name}.`);
+              console.log(`(the last game ran ${plies} ${plies === 1 ? 'ply' : 'plies'} here`
+                + `${saved ? `, kept as ${saved}` : ''})`);
+              const announce = `New game. You are ${name}.`;
+              audio.speak(announce, { priority: 'low' });
+              overlay.say(announce);
+              showReview(review);
+              return true;
+            }
+          }
+          log.event('newgame', {
+            ok: false, reason: 'near-start-read-failed', turned,
+            misfits: nearSame ? probe.same.misfits : probe.turned.misfits,
+            readOk: !!read,
+            ...(read ? { pieces: read.fen.split(' ')[0].replace(/[0-9/]/g, '').length } : {}),
+          });
+        }
+      }
+
       return false;
     }
 
@@ -1007,6 +1237,9 @@ async function main() {
       + ' Starting over at move 1.');
     console.log(`(the last game ran ${plies} ${plies === 1 ? 'ply' : 'plies'} here`
       + `${saved ? `, kept as ${saved}` : ''})`);
+    const announce = `New game. You are ${name}.`;
+    audio.speak(announce, { priority: 'low' });
+    overlay.say(announce);
     showReview(review);
     return true;
   };
@@ -1288,9 +1521,25 @@ async function main() {
     }
     const grabbed = Date.now();
 
-    // `h` pressed on the overlay window, which usually owns the keyboard.
-    const pressed = overlay.takeKey();     // a key pressed on the overlay window
-    if (pressed) askKey(pressed);
+    // A key pressed on the overlay window, which usually owns the keyboard — or
+    // `q` written to the same file by something that did not start us.
+    const pressed = overlay.takeKey();
+    /*
+     * Stop by *calling* shutdown, never by setting `stopping`.
+     *
+     * Setting the flag would end this loop, but `shutdown()` opens with
+     * `if (stopping) return`, so the `await shutdown()` after the loop would then
+     * do nothing: no final PGN, no review, and three child processes left alive.
+     * That flag is shutdown's guard against running twice, not a way to ask for
+     * it. The `break` below is unreachable — shutdown exits — but leaving the
+     * loop honestly is cheaper than explaining why it would not need to.
+     */
+    if (pressed === 'q') { await shutdown(); break; }
+    if (pressed === 'm') {
+      const msg = audio.toggleMute() ? 'voice muted' : 'voice on';
+      console.log(`      ${msg}`);
+      overlay.hint(msg);
+    } else if (pressed) askKey(pressed);
 
     const det = model.detectMove(frame, chess, {
       squareLimit, softLimit, excuse: decorated(chess, lastMove, model.flipped),

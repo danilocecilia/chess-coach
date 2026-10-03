@@ -13,16 +13,14 @@
  * a session actually starts.
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { Engine } from '../src/engine.js';
-import { STOCKFISH, DEPTH, LOG_DIR } from '../src/config.js';
-import { loadReview } from '../src/report.js';
+import { STOCKFISH, DEPTH } from '../src/config.js';
 import { FAULTS } from '../src/review.js';
-import { scenariosFrom, pickSet, summariseSession, DRILLABLE } from '../src/play.js';
+import { summariseSession, DRILLABLE } from '../src/play.js';
 import { PlaySession, PlayServer, DEFAULT_PORT } from '../src/play-server.js';
+import { HISTORY, buildDeck, writeHistory } from '../src/play-deck.js';
 
-const HISTORY = path.join(LOG_DIR, 'play-history.json');
 const THREAT_DEPTH = Number(process.env.COACH_THREAT_DEPTH ?? 12);
 
 /* ------------------------------------------------------------------ args ---- */
@@ -45,39 +43,7 @@ if (kind && !DRILLABLE.includes(kind)) {
 
 /* ------------------------------------------------------------------ deck ---- */
 
-/** Every reviewed game on disk, with the id the review is stored under. */
-function reviewedGames() {
-  const games = [];
-  if (!existsSync(LOG_DIR)) return games;
-  for (const session of readdirSync(LOG_DIR).sort()) {
-    const found = loadReview(path.join(LOG_DIR, session));
-    (found ?? []).forEach((g, i) => {
-      if (g.graded > 0) games.push({ ...g, id: g.id ?? `${session}#${i + 1}` });
-    });
-  }
-  return games;
-}
-
-const readHistory = () => {
-  if (!existsSync(HISTORY)) return {};
-  try {
-    const data = JSON.parse(readFileSync(HISTORY, 'utf8'));
-    return data?.scenarios ?? {};
-  } catch { return {}; /* half-written, or from a future version */ }
-};
-
-/** Never a reason to lose a session: the record is a convenience, not the game. */
-const writeHistory = (scenarios) => {
-  try {
-    mkdirSync(path.dirname(HISTORY), { recursive: true });
-    writeFileSync(HISTORY, JSON.stringify({ version: 1, saved: new Date().toISOString(), scenarios }, null, 1));
-    return true;
-  } catch { return false; }
-};
-
-const games = reviewedGames();
-const deck = scenariosFrom(games);
-const history = readHistory();
+const { games, deck, history, chosen } = buildDeck({ size, kind });
 
 if (!deck.length) {
   console.error('nothing to play yet.\n'
@@ -86,8 +52,6 @@ if (!deck.length) {
     + '  Play a game under the coach, or run:  node tools/review.mjs --deep --all');
   process.exit(1);
 }
-
-const chosen = pickSet(deck, { history, size, kind });
 
 /* --------------------------------------------------------------- dry run ---- */
 

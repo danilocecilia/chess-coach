@@ -15,12 +15,14 @@
  * or naming your own loose piece, points at the problem; finding the move stays
  * your job, which is both better teaching and a cleaner line to hold.
  *
- * There is still no topic that names your move.
+ * The `s` topic is the exception: it names your move, in steps, so you can
+ * stop early if you want a nudge rather than a spoiler.
  */
 
 import { classify, materialWord } from './verdict.js';
-import { netMaterial } from './grade.js';
+import { netMaterial, pvToSan } from './grade.js';
 import { audit } from './audit.js';
+import { spellMove } from './san.js';
 
 const NAME = { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
 
@@ -109,8 +111,12 @@ export function threatSteps(threat) {
   return [
     threat.mate ? 'he has a mating idea here' : 'he has a real threat here',
     aimed,
-    // His move, not yours. Naming what he wants to play is the whole point.
-    `${threat.san} is the idea — ${threatCost(threat)}`,
+    // His move, not yours. Naming what he wants to play is the whole point —
+    // and it is named in words as well as notation, because this is the one
+    // line here that is pure notation and the overlay has no hover to put a
+    // reading behind. A move you cannot read is not an answer to "what is he
+    // threatening".
+    `${spellMove(threat.san)} is the idea — ${threatCost(threat)}`,
   ];
 }
 
@@ -122,6 +128,69 @@ export function weaknessSteps(chess, color) {
     return ['nothing loose, king is fine, pieces are out — go look for a plan'];
   }
   return found.map((f) => f.text);
+}
+
+/* ------------------------------------------------------------------ s ----- */
+
+/**
+ * The full answer: piece, destination and continuation, all at once.
+ *
+ * For a player who already thought it through and just wants to know what the
+ * engine says. Step 1 is the move; step 2 is the line behind it.
+ */
+export function answerSteps(chess, lines, fen) {
+  if (!lines?.length) return null;
+  const pv = lines[0].pv;
+  if (!pv?.length) return null;
+
+  const uci = pv[0];
+  const move = chess.moves({ verbose: true })
+    .find((m) => m.from + m.to + (m.promotion ?? '') === uci);
+  if (!move) return null;
+
+  const steps = [spellMove(move.san)];
+
+  if (pv.length > 1) {
+    const line = pvToSan(fen, pv, 6);
+    if (line) steps.push(`the line: ${line}`);
+  }
+
+  return steps;
+}
+
+/**
+ * What the engine thinks you should play, revealed in steps.
+ *
+ * Step 1 names the piece without the destination — narrow enough to be useful,
+ * vague enough that the answer is still yours to find. Step 2 names the move.
+ * Step 3 shows the continuation so you can see why.
+ */
+export function suggestSteps(chess, lines, fen) {
+  if (!lines?.length) return null;
+  const pv = lines[0].pv;
+  if (!pv?.length) return null;
+
+  const uci = pv[0];
+  const move = chess.moves({ verbose: true })
+    .find((m) => m.from + m.to + (m.promotion ?? '') === uci);
+  if (!move) return null;
+
+  const steps = [];
+
+  if (/^O-O/.test(move.san)) {
+    steps.push('consider castling');
+  } else {
+    steps.push(`look at your ${NAME[move.piece]} on ${move.from}`);
+  }
+
+  steps.push(spellMove(move.san));
+
+  if (pv.length > 1) {
+    const line = pvToSan(fen, pv, 6);
+    if (line) steps.push(`the line: ${line}`);
+  }
+
+  return steps;
 }
 
 /* ------------------------------------------------------------- topics ----- */
@@ -148,6 +217,16 @@ export const TOPICS = {
       missCost(ctx.chess, ctx.lines)?.text,
       atStake(ctx.fen, ctx.lines, ctx.color)?.text,
     ].filter(Boolean),
+  },
+  s: {
+    label: 'suggest',
+    needsThreat: false,
+    steps: (ctx) => suggestSteps(ctx.chess, ctx.lines, ctx.fen),
+  },
+  a: {
+    label: 'answer',
+    needsThreat: false,
+    steps: (ctx) => answerSteps(ctx.chess, ctx.lines, ctx.fen),
   },
 };
 

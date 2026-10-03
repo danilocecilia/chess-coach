@@ -75,9 +75,17 @@ const LIVE = `
 `;
 
 export class Dashboard {
-  constructor({ port = DEFAULT_PORT, open = false } = {}) {
+  constructor({ port = DEFAULT_PORT, open = false, mounted = false } = {}) {
     this.port = port;
     this.wantOpen = open;
+    /*
+     * Set when another server owns the socket and only calls `handle` — see
+     * `src/hub.js`. There is then no `this.server` for `notify` to check, and
+     * without a second way to tell it is live a mounted dashboard would accept
+     * SSE clients and then never push anything to them: the page would sit
+     * there, connected, going stale after every graded move.
+     */
+    this.mounted = mounted;
     this.server = null;
     this.clients = new Set();
     this.url = null;
@@ -95,7 +103,7 @@ export class Dashboard {
     return new Promise((resolve) => {
       try { rebuild(); } catch { /* the page can be built on first request */ }
 
-      this.server = createServer((req, res) => this.#serve(req, res));
+      this.server = createServer((req, res) => this.handle(req, res));
       this.server.on('error', () => resolve(null));           // port taken, no permission
       this.server.listen(this.port, HOST, () => {
         // Port 0 asks the OS for a free one, which is what a test wants and
@@ -109,8 +117,19 @@ export class Dashboard {
     });
   }
 
-  #serve(req, res) {
-    const path = (req.url ?? '/').split('?')[0];
+  /**
+   * Answer one request.
+   *
+   * `mounted` names the route to dispatch on when something else owns the
+   * server, so the same branches a standalone dashboard reaches are reachable
+   * from a shared origin. `src/hub.js` serves this page at `/review` — but
+   * `/events` has to stay at the root, because the injected script above
+   * hardcodes `new EventSource('/events')` and so does `tests/dashboard.test.js`.
+   * Hence a mount point passed per request rather than a prefix stripped here:
+   * the two routes move independently.
+   */
+  handle(req, res, mounted = null) {
+    const path = mounted ?? (req.url ?? '/').split('?')[0];
 
     if (path === '/events') {
       res.writeHead(200, {
@@ -158,7 +177,7 @@ export class Dashboard {
    * write its page is not a reason to stop coaching.
    */
   notify() {
-    if (!this.server) return;
+    if (!this.server && !this.mounted) return;
     try { rebuild(); } catch { return; }
     for (const res of this.clients) {
       try { res.write('data: 1\n\n'); } catch { this.clients.delete(res); }

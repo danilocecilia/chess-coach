@@ -30,6 +30,18 @@ export const PANEL_CONFIG = path.join(ROOT, 'panel.json');
 export const LOG_DIR = path.join(ROOT, 'logs');
 
 /**
+ * Written by the coach while it runs, so something else can tell whether one is
+ * live without having spawned it.
+ *
+ * That asymmetry is the point: the hub can be restarted, or started for the
+ * first time, while a coach launched from a terminal is already watching a
+ * board. A pid on disk is the only thing the two reliably share. Removed last of
+ * all in `shutdown()`, so "the file is gone" means the teardown finished rather
+ * than merely began.
+ */
+export const PID_FILE = path.join(ROOT, '.coach.pid');
+
+/**
  * Jev == OpenRouter. The local :59444 router is Claude Code's own, not ours.
  *
  * There is deliberately no vision model here. The original design used one to

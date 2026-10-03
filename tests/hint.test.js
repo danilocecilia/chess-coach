@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Chess } from 'chess.js';
-import { missCost, atStake, threatSteps, weaknessSteps, TOPICS, KEYS } from '../src/hint.js';
+import { missCost, atStake, threatSteps, weaknessSteps, suggestSteps, answerSteps, TOPICS, KEYS } from '../src/hint.js';
 import { nullMoveFen } from '../src/threat.js';
 import { netMaterial } from '../src/grade.js';
 
@@ -85,6 +85,19 @@ test('the threat topic names his move, and only his', () => {
   assert.match(steps[2], /wins a piece/);
 });
 
+test('his move is read out as well as notated', () => {
+  /*
+   * The overlay has no hover to hide a reading behind, and this line is the one
+   * place the coach answers in pure notation. Both halves matter: the words so
+   * the hint can be acted on today, the notation so it stops being needed.
+   */
+  const steps = threatSteps({
+    san: 'Qxe8#', from: 'd8', to: 'e8', target: { type: 'r', color: 'w' },
+    costsMaterial: 5, costsWinPct: 99, mate: 1, serious: true,
+  });
+  assert.match(steps[2], /Qxe8# \(queen takes on e8, checkmate\)/);
+});
+
 test('a free move is not dressed up as a threat', () => {
   const steps = threatSteps({ san: 'Nf6', to: 'f6', target: null,
     costsMaterial: 0, costsWinPct: 6, mate: null, serious: false });
@@ -110,6 +123,46 @@ test('every topic answers, and none of them needs the engine except the threat',
     if (topic.needsThreat) assert.equal(steps, null, `${key} should wait for its search`);
     else assert.ok(steps.length > 0, `${key} produced nothing`);
   }
+});
+
+test('the suggest topic names the piece, then the move, then the line', () => {
+  const chess = new Chess(START);
+  const steps = suggestSteps(chess, lines(50, -850), START);
+  assert.equal(steps.length, 3);
+  assert.match(steps[0], /knight on g1/);
+  assert.match(steps[1], /Nf3/);
+  assert.match(steps[2], /the line:/);
+});
+
+test('suggest handles castling', () => {
+  const fen = 'r1bqk2r/ppppbppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4';
+  const chess = new Chess(fen);
+  const pv = ['e1g1'];
+  const steps = suggestSteps(chess, [{ score: { cp: 50 }, pv, depth: 18, multipv: 1 }], fen);
+  assert.ok(steps);
+  assert.match(steps[0], /castling/);
+  assert.match(steps[1], /O-O/);
+});
+
+test('suggest returns null when there are no lines', () => {
+  const chess = new Chess(START);
+  assert.equal(suggestSteps(chess, null, START), null);
+  assert.equal(suggestSteps(chess, [], START), null);
+});
+
+test('answer shows the move directly without naming the piece first', () => {
+  const chess = new Chess(START);
+  const steps = answerSteps(chess, lines(50, -850), START);
+  assert.equal(steps.length, 2);
+  assert.match(steps[0], /Nf3/);
+  assert.match(steps[0], /knight/);
+  assert.match(steps[1], /the line:/);
+});
+
+test('answer returns null when there are no lines', () => {
+  const chess = new Chess(START);
+  assert.equal(answerSteps(chess, null, START), null);
+  assert.equal(answerSteps(chess, [], START), null);
 });
 
 test('the null move hands over the turn and drops en passant', () => {

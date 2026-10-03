@@ -11,10 +11,12 @@
     "review": "node tools/review.mjs",
     "play": "node tools/play.mjs",
     "dashboard": "node tools/dashboard.mjs",
+    "hub": "node tools/hub.mjs",
     "find-board": "node tools/find-board.mjs",
     "test": "node --test \"tests/*.test.js\""
   },
   "dependencies": {
-    "chess.js": "^1.0.0"
+    "chess.js": "^1.0.0",
+    "node-edge-tts": "^1.2.10"
   }
 }

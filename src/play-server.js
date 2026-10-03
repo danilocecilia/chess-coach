@@ -556,7 +556,7 @@ export class PlayServer {
 
   start() {
     return new Promise((resolve, reject) => {
-      this.server = createServer((req, res) => void this.#serve(req, res));
+      this.server = createServer((req, res) => void this.handle(req, res));
       // Unlike the dashboard, a port we cannot have is fatal: the dashboard is a
       // convenience beside a game that is happening anyway, and this *is* the game.
       this.server.on('error', reject);
@@ -569,9 +569,21 @@ export class PlayServer {
     });
   }
 
-  async #serve(req, res) {
+  /**
+   * Answer one request.
+   *
+   * `mounted` overrides the dispatch path for a server that owns more than this
+   * session: `src/hub.js` serves the page at `/play` but leaves `/api/*` at the
+   * root, because the three fetches in `src/play-page.js` are root-relative and
+   * a `<base href>` does not rewrite those — moving the API would mean editing
+   * the client, which is the one thing a shared origin should not cost.
+   *
+   * Only the dispatch key is overridden. `url` stays the real request, because
+   * the `legal` branch below reads `url.searchParams`.
+   */
+  async handle(req, res, mounted = null) {
     const url = new URL(req.url ?? '/', `http://${HOST}`);
-    const path = url.pathname;
+    const path = mounted ?? url.pathname;
 
     if (path === '/') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -643,14 +655,14 @@ export class PlayServer {
  */
 const withState = (session, out) => (out?.error ? { ...session.state, error: out.error } : out);
 
-function json(res, code, data) {
+export function json(res, code, data) {
   const body = JSON.stringify(data);
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(body);
 }
 
 /** A small JSON body, with a cap: this listens on loopback but still parses input. */
-function readJson(req, limit = 64 * 1024) {
+export function readJson(req, limit = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let raw = '';
     req.on('data', (c) => {
